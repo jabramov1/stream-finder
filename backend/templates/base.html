@@ -1,9 +1,13 @@
 <!doctype html>
-<title>{% block title %}{% endblock %} - Streamer Search</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Kanit&family=Montserrat&family=Open+Sans:wght@500&display=swap"
-    rel="stylesheet">
+<html>
+
+<head>
+    <title>{% block title %}{% endblock %} - Streamer Search</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Kanit&family=Montserrat&family=Open+Sans:wght@500&display=swap"
+        rel="stylesheet">
+</head>
 
 <body class="dark-theme">
     <div class="full-body-container">
@@ -21,16 +25,12 @@
                 <input placeholder="Search for a Twitch streamer" id="filter-text-val" onkeyup="filterText()">
             </div>
         </div>
-        <div id="answer-box">
-            <!-- Search results will populate here -->
-        </div>
+        <div id="answer-box"></div>
     </div>
 
     <script>
-        // Theme toggle functionality
-        document.addEventListener('DOMContentLoaded', function () {
+        document.addEventListener('DOMContentLoaded', () => {
             const themeSwitch = document.getElementById('theme-switch');
-            document.body.classList.add('dark-theme');
             themeSwitch.checked = true;
             localStorage.setItem('theme', 'dark');
             themeSwitch.addEventListener('change', function () {
@@ -44,143 +44,90 @@
             });
         });
 
-        // Generates HTML for a streamer card, including Twitch info and placeholder for live metrics.
-        function streamerCardTemplate(streamerData) {
-            let twitchSection = "";
-            if (streamerData.twitch_info) {
-                const username = streamerData.twitch_info.username || streamerData.name;
-                const imagePath = streamerData.image_path || "images/placeholder.jpg";
-                const bioText = streamerData.csv_data && streamerData.csv_data.Description ?
-                    streamerData.csv_data.Description : "";
-                twitchSection = `
-                    <div class="twitch-profile">
-                        <div class="streamer-header">
-                            <img src="/static/${imagePath}"
-                                alt="${streamerData.name}"
-                                class="streamer-image"
-                                onerror="this.src='/static/images/placeholder.jpg'" />
-                            <div class="streamer-info">
-                                <h3>${streamerData.name}</h3>
-                                ${bioText ? `<p class="bio-text">${bioText}</p>` : ''}
-                                <a href="${streamerData.twitch_info.url}" target="_blank" class="twitch-link">
-                                    <img src="/static/images/logo.png" alt="Twitch" class="twitch-icon" />
-                                    Visit ${username}'s Twitch Channel
-                                </a>
-                            </div>
-                        </div>
-                        <div class="twitch-metrics" id="metrics-${streamerData.name}"></div>
-                    </div>
-                `;
-            } else {
-                const bioText = streamerData.csv_data && streamerData.csv_data.Description ?
-                    streamerData.csv_data.Description : "";
-                twitchSection = `
-                    <div class="twitch-profile">
-                        <div class="streamer-header">
-                            <img src="/static/images/placeholder.jpg"
-                                alt="${streamerData.name}"
-                                class="streamer-image" />
-                            <div class="streamer-info">
-                                <h3>${streamerData.name}</h3>
-                                ${bioText ? `<p class="bio-text">${bioText}</p>` : ''}
-                                <p>No Twitch information available</p>
-                            </div>
-                        </div>
-                        <div class="twitch-metrics" id="metrics-${streamerData.name}"></div>
-                    </div>
-                `;
-            }
+        function sendFocus() { document.getElementById('filter-text-val').focus(); }
 
-            let documentsHtml = "";
-            if (streamerData.documents && streamerData.documents.length > 0) {
-                documentsHtml = `
-                    <div class="document-list">
-                        <h4>Related Content</h4>
-                        ${streamerData.documents.map(doc => documentTemplate(doc)).join('')}
-                    </div>
-                `;
-            }
-
+        function documentTemplate(d) {
             return `
-                <div class="streamer-card" data-streamer="${streamerData.name}">
-                    ${twitchSection}
-                    ${documentsHtml}
-                </div>
-            `;
+    <div class="document-item">
+      <p class="doc">${d.doc}</p>
+      <div class="meta-info">
+        <span class="source">Source: ${d.source}</span>
+        <span class="sim-score">Score: ${d.sim_score}</span>
+      </div>
+    </div>`;
         }
 
-        function documentTemplate(doc) {
-            return `
-                <div class="document-item">
-                    <p class="doc">${doc.doc}</p>
-                    <div class="meta-info">
-                        <span class="source">Source: ${doc.source}</span>
-                        <span class="sim-score">Score: ${doc.sim_score}</span>
-                    </div>
-                </div>
-            `;
-        }
+        function streamerCardTemplate(s) {
+            // TwitchTracker
+            let tt = s.twitchtracker || {};
+            let summary = tt.avg_viewers
+                ? `<div class="tt-summary">
+         <h4>30d Summary</h4>
+         <p>Avg viewers: ${tt.avg_viewers.toLocaleString()}</p>
+         <p>Max viewers: ${tt.max_viewers.toLocaleString()}</p>
+         <p>Hours watched: ${tt.hours_watched.toLocaleString()}</p>
+         <p>Followers gained: ${tt.followers.toLocaleString()}</p>
+       </div>`
+                : `<p>No 30‑day data.</p>`;
 
-        function sendFocus() {
-            document.getElementById('filter-text-val').focus();
+            // build card
+            return `
+    <div class="streamer-card" data-streamer="${s.name}">
+      <div class="twitch-profile">
+        <div class="streamer-header">
+          <img src="/static/${s.image_path}" 
+               alt="${s.name}" 
+               class="streamer-image"
+               onerror="this.src='/static/images/placeholder.jpg'"/>
+          <div class="streamer-info">
+            <h3>${s.name}</h3>
+            ${s.csv_data && s.csv_data.Description ? `<p class="bio-text">${s.csv_data.Description}</p>` : ''}
+            ${s.twitch_info
+                    ? `<a href="${s.twitch_info.url}" target="_blank" class="twitch-link">
+                   <img src="/static/images/logo.png" class="twitch-icon"/>
+                   Visit Twitch
+                 </a>`
+                    : `<p>No Twitch info.</p>`
+                }
+          </div>
+        </div>
+        ${summary}
+      </div>
+      ${s.documents.length
+                    ? `<div class="document-list">
+             <h4>Related Content</h4>
+             ${s.documents.map(d => documentTemplate(d)).join('')}
+           </div>`
+                    : ''
+                }
+    </div>`;
         }
 
         function filterText() {
-            document.getElementById("answer-box").innerHTML = "";
-            const searchTerm = document.getElementById("filter-text-val").value;
-            if (searchTerm.trim() === "") return;
-
-            fetch("/search?" + new URLSearchParams({ name: searchTerm }).toString())
-                .then(response => response.json())
+            const box = document.getElementById("answer-box");
+            box.innerHTML = "";
+            const term = document.getElementById("filter-text-val").value;
+            if (!term.trim()) return;
+            fetch("/search?" + new URLSearchParams({ name: term }))
+                .then(r => r.json())
                 .then(data => {
-                    if (data.length === 0) {
-                        document.getElementById("answer-box").innerHTML = "<div class='no-results'>No results found</div>";
+                    if (!data.length) {
+                        box.innerHTML = "<div class='no-results'>No results found</div>";
                         return;
                     }
-                    data.forEach(streamerData => {
-                        let tempDiv = document.createElement("div");
-                        tempDiv.innerHTML = streamerCardTemplate(streamerData);
-                        document.getElementById("answer-box").appendChild(tempDiv);
+                    data.forEach(s => {
+                        let div = document.createElement("div");
+                        div.innerHTML = streamerCardTemplate(s);
+                        box.appendChild(div);
                     });
-                    // After results render, update live metrics
-                    updateLiveIndicators();
                 })
-                .catch(error => {
-                    console.error("Error fetching search results:", error);
-                    document.getElementById("answer-box").innerHTML = "<div class='error'>An error occurred while searching</div>";
+                .catch(e => {
+                    console.error("Search error", e);
+                    box.innerHTML = "<div class='error'>An error occurred</div>";
                 });
         }
-
-        // Function to update live metrics for each streamer card by calling the live-status service.
-        function updateLiveIndicators() {
-            const cards = document.querySelectorAll(".streamer-card");
-            cards.forEach(card => {
-                const streamerName = card.getAttribute("data-streamer");
-                if (streamerName) {
-                    fetch("http://localhost:5002/live-status?streamer=" + encodeURIComponent(streamerName))
-                        .then(response => response.json())
-                        .then(data => {
-                            const metricsDiv = document.getElementById("metrics-" + streamerName);
-                            if (metricsDiv) {
-                                if (data.is_live) {
-                                    metricsDiv.innerHTML = `
-                                        <span class="live-indicator">LIVE</span>
-                                        <div class="twitch-stats">
-                                            <span>Viewers: ${data.viewer_count}</span>
-                                            <span>Followers: ${data.follower_count}</span>
-                                            ${data.game_name ? `<span>Game: ${data.game_name}</span>` : ""}
-                                        </div>
-                                    `;
-                                } else {
-                                    metricsDiv.innerHTML = `<span class="offline-status">Offline</span>`;
-                                }
-                            }
-                        })
-                        .catch(error => console.error("Live status check error for", streamerName, ":", error));
-                }
-            });
-        }
     </script>
+
 
     <style>
         /* Base styles (light theme) */
@@ -302,24 +249,6 @@
             box-shadow: 0 6px 15px var(--shadow-color);
         }
 
-        .live-indicator {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            background-color: red;
-            color: white;
-            padding: 5px 10px;
-            font-weight: bold;
-            border-radius: 5px;
-            z-index: 2;
-        }
-
-        .twitch-metrics {
-            margin-top: 10px;
-            font-size: 14px;
-            color: var(--secondary-text);
-        }
-
         .twitch-profile {
             margin-bottom: 15px;
             padding-bottom: 15px;
@@ -341,15 +270,17 @@
             box-shadow: 0 3px 6px var(--shadow-color);
         }
 
-        .streamer-info {
-            flex: 1;
-        }
-
         .streamer-info h3 {
             margin: 0 0 8px 0;
             font-family: 'Kanit', sans-serif;
             font-size: 24px;
             color: var(--text-color);
+        }
+
+        .bio-text {
+            margin: 0 0 8px 0;
+            font-size: 14px;
+            color: var(--secondary-text);
         }
 
         .twitch-link {
