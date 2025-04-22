@@ -20,14 +20,13 @@ MODEL_NAME   = "sentence-transformers/all-MiniLM-L6-v2"
 META_PATH    = "metadata.pkl"
 BOOLEAN_INDEX_PATH = "boolean_index.pkl"
 
-# --- Float16 Configuration ---
-EMBED_PATH_FP16 = "embeddings_fp16.npy" # Preferred path
-EMBED_PATH_FP32_FALLBACK = "embeddings.npy" # Fallback path (will check dtype)
-EXPECTED_EMBED_DTYPE = np.float16
+# --- Float32 Configuration ---
+EMBED_PATH_FP32 = "embeddings_fp32.npy" # Preferred path
+EXPECTED_EMBED_DTYPE = np.float32
 
 BUILD_INDEX_ON_MISSING = True
 TOP_K        = 20 # Adjusted from 25 based on previous code
-EMBED_DIM    = 768 # Will be verified
+EMBED_DIM    = 384 # Will be verified
 SEMANTIC_WEIGHT = 0.5
 BOOLEAN_WEIGHT = 0.5
 
@@ -53,6 +52,28 @@ else: print(f"Info: {CSV_PATH} not found.")
 # ───────────────────────────────────────────────────────────────────────────────
 # BOOLEAN SEARCH FUNCTIONS (As before)
 # ───────────────────────────────────────────────────────────────────────────────
+
+def make_snippet_sentence(text: str, terms: list[str], max_len: int = 300) -> str:
+    """
+    Split `text` into sentences, find the first one containing any term,
+    and return it (trimmed to max_len if needed, with ellipsis).
+    """
+    clean = text.replace("\n", " ")
+    # split on sentence boundaries
+    sentences = re.split(r'(?<=[.!?])\s+', clean)
+    for sent in sentences:
+        for t in terms:
+            if t.lower() in sent.lower():
+                sent = sent.strip()
+                if len(sent) <= max_len:
+                    return sent
+                # still return the full sentence head-trimmed
+                return sent[:max_len].rstrip() + "…"
+    # fallback to the first max_len chars
+    head = clean[:max_len].rstrip()
+    return head + ("…" if len(clean) > max_len else "")
+
+
 def create_boolean_index():
     # (Function content remains the same as previous minimal version)
     index = defaultdict(list)
@@ -70,16 +91,18 @@ def create_boolean_index():
     wiki_idx_counter = 0 # Defined for list case
     if isinstance(wiki_data, dict): # Wiki (dict format)
         for streamer, entry in wiki_data.items():
-            if isinstance(entry, dict) and "wikipedia_summary" in entry:
-                words = re.findall(r"\w+", entry["wikipedia_summary"].lower())
+            if isinstance(entry, dict) and "content" in entry:
+                words = re.findall(r"\w+", entry["content"].lower())
                 for w in words: index[w].append(("wiki", streamer, 0)) # Use 0 for dict case idx
-    elif isinstance(wiki_data, list): # Wiki (list format)
-        for i, entry in enumerate(wiki_data): # Iterate with index i
-            if isinstance(entry, dict) and "wikipedia_summary" in entry and "streamer" in entry:
+    elif isinstance(wiki_data, list):  # Wiki (list format)
+        for i, entry in enumerate(wiki_data):
+            if isinstance(entry, dict) and "content" in entry and "streamer" in entry:
                 sn = entry["streamer"]
-                words = re.findall(r"\w+", entry["wikipedia_summary"].lower())
-                index[w].append(("wiki", sn, i)) # Use actual list index i
-                # wiki_idx_counter += 1 # Not needed if using i
+                words = re.findall(r"\w+", entry["content"].lower())
+                for w in words:
+                    index[w].append(("wiki", sn, i))
+
+
     for streamer, details in details_data.items(): # Details
         if isinstance(details, dict): # Added check
             words = re.findall(r"\w+", str(details.get("Description", "")).lower())
@@ -113,8 +136,8 @@ def boolean_search(query, index):
                              elif isinstance(wiki_data, list) and 0 <= idx < len(wiki_data) and isinstance(wiki_data[idx], dict) and wiki_data[idx].get("streamer") == streamer:
                                  we = wiki_data[idx]
 
-                             if we and "wikipedia_summary" in we:
-                                 doc_entry, text, score = we, we["wikipedia_summary"], 2
+                             if we and "content" in we:
+                                 doc_entry, text, score = we, we["content"], 2
                         elif source == "details" and streamer in details_data and isinstance(details_data[streamer], dict):
                              doc_entry, text, score = details_data[streamer], str(details_data[streamer].get("Description", "")), 3
 
@@ -126,23 +149,52 @@ def boolean_search(query, index):
     return list(doc_info.values())
 
 def score_boolean_results(results, query):
-    # (Function content remains the same as previous minimal version)
-    qt = set(re.findall(r"\w+", query.lower())); scored = []
+    """
+    Score your boolean hits and return only a sentence snippet
+    around the matched term instead of the full doc.
+    """
+    qt     = re.findall(r"\w+", query.lower())
+    scored = []
+
     for doc in results:
-        # Added check if doc is a dictionary
-        if not isinstance(doc, dict): continue
-        score = doc.get("term_matches", 0) * 15; text = doc.get("text", "").lower() # Added default empty string
-        score += sum(text.count(term) * 5 for term in qt)
+        if not isinstance(doc, dict):
+            continue
+
+        text = doc.get("text", "")  # full article
+
+        # 1) compute your original boolean score
+        score = doc.get("term_matches", 0) * 15
+        score += sum(text.lower().count(term) * 5 for term in qt)
         ss = doc.get("score", 1)
-        # Added check for numeric score before division
-        if doc["source"] == "reddit" and isinstance(ss, (int, float)): score += min(ss / 500.0, 20) if ss > 0 else 0
-        elif doc["source"] == "wiki": score += 15
-        elif doc["source"] == "details": score += 10
-        if query.lower() in text: score += 50
-        fmt = {"source": doc["source"], "name": doc["streamer"], "doc": text[:150] + ("..." if len(text) > 150 else ""), "boolean_score": round(score, 2), "term_matches": doc.get("term_matches", 0)}
-        if doc["source"] == "reddit" and isinstance(doc.get("data"), dict): fmt["reddit_score"], fmt["id"] = ss, doc["data"].get("ID", "")
+        if doc["source"] == "reddit" and isinstance(ss, (int, float)):
+            score += min(ss / 500.0, 20) if ss > 0 else 0
+        elif doc["source"] == "wiki":
+            score += 15
+        elif doc["source"] == "details":
+            score += 10
+        if query.lower() in text.lower():
+            score += 50
+
+        # 2) extract just the sentence snippet
+        snippet = make_snippet_sentence(text, qt)
+        fmt = {
+            "source":        doc["source"],
+            "name":          doc["streamer"],
+            "snippet":       snippet,
+            "doc":           snippet,             # ← add this line
+            "boolean_score": round(score, 2),
+            "term_matches":  doc.get("term_matches", 0)
+        }
+
+        if doc["source"] == "reddit" and isinstance(doc.get("data"), dict):
+            fmt["reddit_score"] = ss
+            fmt["id"]           = doc["data"].get("ID", "")
+
         scored.append((fmt, score))
-    scored.sort(key=lambda x: x[1], reverse=True); return [d for d, _ in scored]
+
+    # sort and return only the dicts
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [d for d, _ in scored]
 
 # ───────────────────────────────────────────────────────────────────────────────
 # SEMANTIC SEARCH FUNCTIONS
@@ -161,12 +213,12 @@ def gather_documents():
     wiki_idx_counter = 0
     if isinstance(wiki_data, dict): # Wiki (dict)
         for streamer, entry in wiki_data.items():
-            if isinstance(entry, dict) and "wikipedia_summary" in entry: docs.append({"text": entry['wikipedia_summary'], "source": "wiki", "streamer": streamer, "idx": 0, "data": entry, "score": 2}) # Removed adding streamer name to text
+            if isinstance(entry, dict) and "content" in entry: docs.append({"text": entry['content'], "source": "wiki", "streamer": streamer, "idx": 0, "data": entry, "score": 2}) # Removed adding streamer name to text
     elif isinstance(wiki_data, list): # Wiki (list)
          for i, entry in enumerate(wiki_data): # Use i
-             if isinstance(entry, dict) and "wikipedia_summary" in entry and "streamer" in entry:
+             if isinstance(entry, dict) and "content" in entry and "streamer" in entry:
                  sn=entry["streamer"]
-                 docs.append({"text": entry['wikipedia_summary'], "source": "wiki", "streamer": sn, "idx": i, "data": entry, "score": 2}) # Use i, Removed adding streamer name
+                 docs.append({"text": entry['content'], "source": "wiki", "streamer": sn, "idx": i, "data": entry, "score": 2}) # Use i, Removed adding streamer name
                  # wiki_idx_counter += 1 # Not needed
     for streamer, det in details_data.items(): # Details
          if isinstance(det, dict): docs.append({"text": str(det.get('Description', '')), "source": "details", "streamer": streamer, "idx": 0, "data": det, "score": 3}) # Removed adding streamer name
@@ -222,7 +274,7 @@ def combine_search_results_weighted_simple(
     boolean_results,
     semantic_results,
     boolean_weight=0.5, # Re-introduce weight
-    semantic_weight=0.5, # Re-introduce weight
+    semantic_weight=0.9, # Re-introduce weight
     score_threshold=5.0   # Keep threshold for single-source results
     ):
 
@@ -408,37 +460,33 @@ EMBEDDINGS = None
 embeddings_loaded = False
 loaded_embedding_dtype = None
 
-build_target_path = EMBED_PATH_FP16
-build_target_dtype = np.float16
+build_target_path = EMBED_PATH_FP32
+build_target_dtype = np.float32
 loaded_path = None
 
-if os.path.exists(EMBED_PATH_FP16) and os.path.exists(META_PATH):
-    try:
-        print(f"Attempting load FP16 embeddings: {EMBED_PATH_FP16}...")
-        EMBEDDINGS = np.load(EMBED_PATH_FP16)
-        with open(META_PATH, "rb") as f: DOCS = pickle.load(f)
-        loaded_path = EMBED_PATH_FP16
-        embeddings_loaded = True
-    except Exception as e:
-        print(f"Warning: Failed load FP16: {e}. Checking fallback path.")
-        EMBEDDINGS, DOCS, embeddings_loaded = None, [], False
+if os.path.exists(EMBED_PATH_FP32) and os.path.exists(META_PATH):
+    print(f"Attempting load FP32 embeddings: {EMBED_PATH_FP32}...")
+    EMBEDDINGS = np.load(EMBED_PATH_FP32)
+    with open(META_PATH, "rb") as f: DOCS = pickle.load(f)
+    loaded_path = EMBED_PATH_FP32
+    embeddings_loaded = True
 
-if not embeddings_loaded and os.path.exists(EMBED_PATH_FP32_FALLBACK) and os.path.exists(META_PATH):
-     try:
-        print(f"Attempting load fallback embeddings: {EMBED_PATH_FP32_FALLBACK}...")
-        EMBEDDINGS = np.load(EMBED_PATH_FP32_FALLBACK)
-        if EMBEDDINGS.dtype != EXPECTED_EMBED_DTYPE:
-             print(f"Warning: Loaded fallback '{EMBED_PATH_FP32_FALLBACK}' dtype {EMBEDDINGS.dtype}, expected {EXPECTED_EMBED_DTYPE}.")
-             print(f"Attempting conversion to {EXPECTED_EMBED_DTYPE}...")
-             EMBEDDINGS = EMBEDDINGS.astype(EXPECTED_EMBED_DTYPE)
-             print(f"Conversion complete. New dtype: {EMBEDDINGS.dtype}")
-             gc.collect()
-        with open(META_PATH, "rb") as f: DOCS = pickle.load(f)
-        loaded_path = EMBED_PATH_FP32_FALLBACK
-        embeddings_loaded = True
-     except Exception as e:
-         print(f"Warning: Failed load fallback {EMBED_PATH_FP32_FALLBACK}: {e}. Will attempt build.")
-         EMBEDDINGS, DOCS, embeddings_loaded = None, [], False
+# if not embeddings_loaded and os.path.exists(EMBED_PATH_FP32_FALLBACK) and os.path.exists(META_PATH):
+#      try:
+#         print(f"Attempting load fallback embeddings: {EMBED_PATH_FP32_FALLBACK}...")
+#         EMBEDDINGS = np.load(EMBED_PATH_FP32_FALLBACK)
+#         if EMBEDDINGS.dtype != EXPECTED_EMBED_DTYPE:
+#              print(f"Warning: Loaded fallback '{EMBED_PATH_FP32_FALLBACK}' dtype {EMBEDDINGS.dtype}, expected {EXPECTED_EMBED_DTYPE}.")
+#              print(f"Attempting conversion to {EXPECTED_EMBED_DTYPE}...")
+#              EMBEDDINGS = EMBEDDINGS.astype(EXPECTED_EMBED_DTYPE)
+#              print(f"Conversion complete. New dtype: {EMBEDDINGS.dtype}")
+#              gc.collect()
+#         with open(META_PATH, "rb") as f: DOCS = pickle.load(f)
+#         loaded_path = EMBED_PATH_FP32_FALLBACK
+#         embeddings_loaded = True
+#      except Exception as e:
+#          print(f"Warning: Failed load fallback {EMBED_PATH_FP32_FALLBACK}: {e}. Will attempt build.")
+#          EMBEDDINGS, DOCS, embeddings_loaded = None, [], False
 
 if embeddings_loaded:
     loaded_embedding_dtype = EMBEDDINGS.dtype
@@ -483,7 +531,7 @@ if not embeddings_loaded or EMBEDDINGS is None or EMBEDDINGS.dtype != EXPECTED_E
     print(f"FATAL: Embeddings not ready or inconsistent before FAISS init. Exiting.")
     sys.exit(1)
 
-# --- Initialize FAISS Index with FP16 and L2 Distance ---
+# --- Initialize FAISS Index with FP32 and L2 Distance ---
 print(f"Initializing FAISS index with L2 distance for {EXPECTED_EMBED_DTYPE} data...")
 index = None
 embeddings_successfully_added = False
