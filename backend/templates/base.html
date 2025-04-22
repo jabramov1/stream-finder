@@ -1,202 +1,13 @@
 <!doctype html>
-<title>{% block title %}{% endblock %} - Streamer Search</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Kanit&family=Montserrat&family=Open+Sans:wght@500&display=swap"
-    rel="stylesheet">
-
-<body class="dark-theme">
-    <div class="full-body-container">
-        <div class="top-text">
-            <img style="width: 20vw;" src="{{ url_for('static', filename='images/logo.png') }}" />
-            <div class="theme-toggle">
-                <label class="switch">
-                    <input type="checkbox" id="theme-switch" checked>
-                    <span class="slider round"></span>
-                </label>
-                <span class="toggle-label">Dark Mode</span>
-            </div>
-            <div class="input-box" onclick="sendFocus()">
-                <img src="{{ url_for('static', filename='images/mag.png') }}" />
-                <input placeholder="Search for a Twitch streamer" id="filter-text-val" onkeyup="filterText()">
-            </div>
-        </div>
-        <div id="answer-box">
-            <!-- Search results will populate here -->
-        </div>
-    </div>
-
-    <script>
-        // Theme toggle functionality
-        document.addEventListener('DOMContentLoaded', function () {
-            const themeSwitch = document.getElementById('theme-switch');
-            document.body.classList.add('dark-theme');
-            themeSwitch.checked = true;
-            localStorage.setItem('theme', 'dark');
-            themeSwitch.addEventListener('change', function () {
-                if (this.checked) {
-                    document.body.classList.add('dark-theme');
-                    localStorage.setItem('theme', 'dark');
-                } else {
-                    document.body.classList.remove('dark-theme');
-                    localStorage.setItem('theme', 'light');
-                }
-            });
-        });
-
-        // Generates HTML for a streamer card, including Twitch info and placeholder for live metrics.
-        function streamerCardTemplate(streamerData) {
-            let twitchSection = "";
-            if (streamerData.twitch_info) {
-                const username = streamerData.twitch_info.username || streamerData.name;
-                const imagePath = streamerData.image_path || "images/placeholder.jpg";
-                const bioText = streamerData.csv_data && streamerData.csv_data.Description ?
-                    streamerData.csv_data.Description : "";
-                twitchSection = `
-                    <div class="twitch-profile">
-                        <div class="streamer-header">
-                            <img src="/static/${imagePath}"
-                                alt="${streamerData.name}"
-                                class="streamer-image"
-                                onerror="this.src='/static/images/placeholder.jpg'" />
-                            <div class="streamer-info">
-                                <h3>${streamerData.name}</h3>
-                                ${bioText ? `<p class="bio-text">${bioText}</p>` : ''}
-                                <a href="${streamerData.twitch_info.url}" target="_blank" class="twitch-link">
-                                    <img src="/static/images/logo.png" alt="Twitch" class="twitch-icon" />
-                                    Visit ${username}'s Twitch Channel
-                                </a>
-                            </div>
-                        </div>
-                        <div class="twitch-metrics" id="metrics-${streamerData.name}"></div>
-                    </div>
-                `;
-            } else {
-                const bioText = streamerData.csv_data && streamerData.csv_data.Description ?
-                    streamerData.csv_data.Description : "";
-                twitchSection = `
-                    <div class="twitch-profile">
-                        <div class="streamer-header">
-                            <img src="/static/images/placeholder.jpg"
-                                alt="${streamerData.name}"
-                                class="streamer-image" />
-                            <div class="streamer-info">
-                                <h3>${streamerData.name}</h3>
-                                ${bioText ? `<p class="bio-text">${bioText}</p>` : ''}
-                                <p>No Twitch information available</p>
-                            </div>
-                        </div>
-                        <div class="twitch-metrics" id="metrics-${streamerData.name}"></div>
-                    </div>
-                `;
-            }
-
-            let documentsHtml = "";
-            if (streamerData.documents && streamerData.documents.length > 0) {
-                documentsHtml = `
-                    <div class="document-list">
-                        <h4>Related Content</h4>
-                        ${streamerData.documents.map(doc => documentTemplate(doc)).join('')}
-                    </div>
-                `;
-            }
-
-            return `
-                <div class="streamer-card" data-streamer="${streamerData.name}">
-                    ${twitchSection}
-                    ${documentsHtml}
-                </div>
-            `;
-        }
-
-        function documentTemplate(doc) {
-            // Generate dimension tags if available
-            let dimensionTags = "";
-            if (doc.top_dimensions && doc.top_dimensions.length > 0) {
-                dimensionTags = `
-                    <div class="dimension-tags">
-                        ${doc.top_dimensions.map(dim => 
-                            `<span class="dimension-tag" title="Relevance dimension">
-                                ${dim.label}
-                             </span>`
-                        ).join('')}
-                    </div>
-                `;
-            }
-
-            return `
-                <div class="document-item" data-source="${doc.source}">
-                    <p class="doc">${doc.doc}</p>
-                    ${dimensionTags}
-                    <div class="meta-info">
-                        <span class="source">Source: ${doc.source}</span>
-                        <span class="sim-score">Score: ${doc.final_score}</span>
-                    </div>
-                </div>
-            `;
-        }
-
-        function sendFocus() {
-            document.getElementById('filter-text-val').focus();
-        }
-
-        function filterText() {
-            document.getElementById("answer-box").innerHTML = "";
-            const searchTerm = document.getElementById("filter-text-val").value;
-            if (searchTerm.trim() === "") return;
-
-            fetch("/search?" + new URLSearchParams({ name: searchTerm }).toString())
-                .then(response => response.json())
-                .then(data => {
-                    if (data.length === 0) {
-                        document.getElementById("answer-box").innerHTML = "<div class='no-results'>No results found</div>";
-                        return;
-                    }
-                    data.forEach(streamerData => {
-                        let tempDiv = document.createElement("div");
-                        tempDiv.innerHTML = streamerCardTemplate(streamerData);
-                        document.getElementById("answer-box").appendChild(tempDiv);
-                    });
-                    // After results render, update live metrics
-                    updateLiveIndicators();
-                })
-                .catch(error => {
-                    console.error("Error fetching search results:", error);
-                    document.getElementById("answer-box").innerHTML = "<div class='error'>An error occurred while searching</div>";
-                });
-        }
-
-        // Function to update live metrics for each streamer card by calling the live-status service.
-        function updateLiveIndicators() {
-            const cards = document.querySelectorAll(".streamer-card");
-            cards.forEach(card => {
-                const streamerName = card.getAttribute("data-streamer");
-                if (streamerName) {
-                    fetch("http://localhost:5002/live-status?streamer=" + encodeURIComponent(streamerName))
-                        .then(response => response.json())
-                        .then(data => {
-                            const metricsDiv = document.getElementById("metrics-" + streamerName);
-                            if (metricsDiv) {
-                                if (data.is_live) {
-                                    metricsDiv.innerHTML = `
-                                        <span class="live-indicator">LIVE</span>
-                                        <div class="twitch-stats">
-                                            <span>Viewers: ${data.viewer_count}</span>
-                                            <span>Followers: ${data.follower_count}</span>
-                                            ${data.game_name ? `<span>Game: ${data.game_name}</span>` : ""}
-                                        </div>
-                                    `;
-                                } else {
-                                    metricsDiv.innerHTML = `<span class="offline-status">Offline</span>`;
-                                }
-                            }
-                        })
-                        .catch(error => console.error("Live status check error for", streamerName, ":", error));
-                }
-            });
-        }
-    </script>
-
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}{% endblock %} - Streamer Search</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Kanit&family=Montserrat&display=swap" rel="stylesheet">
     <style>
         /* Base styles (light theme) */
         :root {
@@ -208,13 +19,10 @@
             --accent-color: #6441a5;
             --hover-bg: rgba(100, 65, 165, 0.1);
             --shadow-color: rgba(0, 0, 0, 0.1);
-            --card-shadow: 0 3px 10px rgba(0, 0, 0, 0.1);
+            --card-shadow: 0 3px 10px var(--shadow-color);
             --input-bg: white;
             --document-bg: #f9f9f9;
-            --tag-bg: rgba(100, 65, 165, 0.1);
-            --tag-color: #6441a5;
         }
-
         /* Dark theme variables */
         body.dark-theme {
             --bg-color: #1a1a1a;
@@ -225,346 +33,203 @@
             --accent-color: #9147ff;
             --hover-bg: rgba(145, 71, 255, 0.2);
             --shadow-color: rgba(0, 0, 0, 0.3);
-            --card-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+            --card-shadow: 0 3px 10px var(--shadow-color);
             --input-bg: #333;
             --document-bg: #2c2c2c;
-            --tag-bg: rgba(145, 71, 255, 0.2);
-            --tag-color: #b47eff;
         }
-
         body {
             background-color: var(--bg-color);
             color: var(--text-color);
-            transition: background-color 0.3s ease, color 0.3s ease;
             margin: 0;
-            padding: 0;
             font-family: 'Montserrat', sans-serif;
         }
-
         .full-body-container {
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            width: 100%;
-            height: 100%;
             display: flex;
-            justify-content: start;
-            align-items: center;
             flex-direction: column;
-        }
-
-        .input-box {
-            border-radius: 50px;
-            border: 1px solid var(--border-color);
-            display: flex;
             align-items: center;
-            margin-top: 20px;
-            padding: 12px 20px;
-            width: 50vw;
-            background-color: var(--input-bg);
-            box-shadow: 0 2px 8px var(--shadow-color);
-            transition: all 0.2s ease;
+            width: 100%;
+            padding: 20px;
         }
-
-        .input-box:hover {
-            box-shadow: 0 4px 12px var(--shadow-color);
-            border-color: var(--accent-color);
-        }
-
-        .input-box img {
-            height: 20px;
-            width: 20px;
-            filter: var(--icon-filter);
-        }
-
         .top-text {
             display: flex;
             flex-direction: column;
             align-items: center;
-            margin-top: 30px;
-            position: relative;
             width: 100%;
+            max-width: 600px;
         }
-
-        .input-box input {
+        .input-box {
+            display: flex;
+            align-items: center;
             width: 100%;
+            max-width: 400px;
+            margin: 10px 0;
+            padding: 10px 15px;
+            border: 1px solid var(--border-color);
+            border-radius: 25px;
+            background-color: var(--input-bg);
+            box-shadow: 0 2px 8px var(--shadow-color);
+        }
+        .input-box img {
+            width: 20px;
+            height: 20px;
+        }
+        .input-box input {
+            flex: 1;
             margin-left: 10px;
-            font-size: 16px;
             border: none;
-            outline: 0;
-            font-family: 'Montserrat', sans-serif;
-            background-color: transparent;
+            outline: none;
+            background: transparent;
+            font-size: 14px;
             color: var(--text-color);
         }
-
-        #answer-box {
-            width: 700px;
-            margin-top: 50px;
-            padding-bottom: 50px;
-        }
-
-        .streamer-card {
-            margin-bottom: 20px;
-            padding: 20px;
-            border-radius: 12px;
-            background-color: var(--card-bg);
-            box-shadow: var(--card-shadow);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-            border: 1px solid var(--border-color);
-            position: relative;
-        }
-
-        .streamer-card:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 6px 15px var(--shadow-color);
-        }
-
-        .live-indicator {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            background-color: red;
-            color: white;
-            padding: 5px 10px;
-            font-weight: bold;
-            border-radius: 5px;
-            z-index: 2;
-        }
-
-        .twitch-metrics {
+        .size-filter {
             margin-top: 10px;
-            font-size: 14px;
-            color: var(--secondary-text);
         }
-
-        .twitch-profile {
-            margin-bottom: 15px;
-            padding-bottom: 15px;
-            border-bottom: 1px solid var(--border-color);
+        .size-filter label {
+            margin-right: 5px;
         }
-
+        .size-filter select {
+            padding: 5px;
+            border: 1px solid var(--border-color);
+            border-radius: 5px;
+            background-color: var(--input-bg);
+            color: var(--text-color);
+        }
+        #answer-box {
+            width: 100%;
+            max-width: 700px;
+            margin-top: 20px;
+        }
+        .streamer-card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            box-shadow: var(--card-shadow);
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
         .streamer-header {
             display: flex;
             align-items: center;
+            padding: 15px;
+            border-bottom: 1px solid var(--border-color);
         }
-
         .streamer-image {
-            width: 70px;
-            height: 70px;
+            width: 60px;
+            height: 60px;
             border-radius: 50%;
             object-fit: cover;
             margin-right: 15px;
-            border: 3px solid var(--accent-color);
-            box-shadow: 0 3px 6px var(--shadow-color);
+            border: 2px solid var(--accent-color);
         }
-
-        .streamer-info {
-            flex: 1;
-        }
-
         .streamer-info h3 {
-            margin: 0 0 8px 0;
+            margin: 0;
             font-family: 'Kanit', sans-serif;
-            font-size: 24px;
-            color: var(--text-color);
+            font-size: 20px;
         }
-
-        .twitch-link {
-            display: inline-flex;
-            align-items: center;
-            color: white;
-            text-decoration: none;
-            font-weight: bold;
-            padding: 6px 12px;
-            border-radius: 5px;
-            background-color: var(--accent-color);
-            transition: background-color 0.2s ease;
-            font-family: 'Montserrat', sans-serif;
-        }
-
-        .twitch-link:hover {
-            background-color: #7a57bc;
-        }
-
-        .twitch-icon {
-            width: 24px;
-            height: 24px;
-            margin-right: 8px;
-            filter: brightness(0) invert(1);
-        }
-
+        .tt-summary,
         .document-list {
-            margin-top: 15px;
-        }
-
-        .document-list h4 {
-            margin: 0 0 12px 0;
-            font-family: 'Kanit', sans-serif;
-            color: var(--text-color);
-        }
-
-        .document-item {
-            margin-bottom: 10px;
             padding: 15px;
-            background-color: var(--document-bg);
-            border-radius: 8px;
-            border-left: 4px solid var(--accent-color);
-            transition: transform 0.1s ease;
         }
-
-        .document-item:hover {
-            transform: translateX(3px);
-        }
-
-        .document-item .doc {
-            margin: 0 0 10px 0;
+        .tt-summary p {
+            margin: 5px 0;
             font-size: 14px;
-            line-height: 1.5;
-            color: var(--text-color);
         }
-
-        /* Dimension tags styling */
-        .dimension-tags {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-            margin-bottom: 8px;
+        .document-item {
+            background-color: var(--document-bg);
+            padding: 10px;
+            border-left: 4px solid var(--accent-color);
+            margin-bottom: 10px;
+            border-radius: 5px;
         }
-
-        .dimension-tag {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 12px;
-            background-color: var(--tag-bg);
-            color: var(--tag-color);
-            font-size: 11px;
-            font-weight: 500;
-            cursor: help;
-            transition: all 0.2s ease;
-        }
-
-        .dimension-tag:hover {
-            background-color: var(--accent-color);
-            color: white;
-            transform: scale(1.05);
-        }
-
-        .meta-info {
+        .document-item .meta-info {
             display: flex;
             justify-content: space-between;
-            font-size: 0.85em;
+            font-size: 12px;
             color: var(--secondary-text);
-            font-family: 'Montserrat', sans-serif;
         }
-
-        .source {
-            font-weight: 500;
-        }
-
-        .sim-score {
-            color: var(--accent-color);
-            font-weight: 500;
-        }
-
         .no-results,
         .error {
-            padding: 30px;
             text-align: center;
+            padding: 20px;
+            margin-top: 20px;
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
             color: var(--secondary-text);
-            font-family: 'Montserrat', sans-serif;
-            background-color: var(--card-bg);
-            border-radius: 8px;
-            box-shadow: var(--card-shadow);
-        }
-
-        .error {
-            color: #cc0000;
-            border-left: 4px solid #cc0000;
-        }
-
-        .theme-toggle {
-            position: absolute;
-            top: -15px;
-            right: 20px;
-            display: flex;
-            align-items: center;
-            padding: 5px 10px;
-            background-color: var(--card-bg);
-            border-radius: 20px;
-            box-shadow: 0 2px 5px var(--shadow-color);
-            z-index: 100;
-        }
-
-        .toggle-label {
-            margin-left: 10px;
-            font-family: 'Montserrat', sans-serif;
-            font-size: 14px;
-            color: var(--text-color);
-        }
-
-        .switch {
-            position: relative;
-            display: inline-block;
-            width: 60px;
-            height: 34px;
-        }
-
-        .switch input {
-            opacity: 0;
-            width: 0;
-            height: 0;
-        }
-
-        .slider {
-            position: absolute;
-            cursor: pointer;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background-color: #ccc;
-            transition: 0.4s;
-            border-radius: 34px;
-        }
-
-        .slider:before {
-            position: absolute;
-            content: "☀️";
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 26px;
-            width: 26px;
-            left: 4px;
-            bottom: 4px;
-            background-color: white;
-            transition: 0.4s;
-            font-size: 14px;
-            border-radius: 50%;
-        }
-
-        input:checked+.slider {
-            background-color: var(--accent-color);
-        }
-
-        input:focus+.slider {
-            box-shadow: 0 0 1px var(--accent-color);
-        }
-
-        input:checked+.slider:before {
-            transform: translateX(26px);
-            content: "🌙";
-            font-size: 16px;
-        }
-
-        .slider.round {
-            border-radius: 34px;
-        }
-
-        .slider.round:before {
-            border-radius: 50%;
         }
     </style>
+</head>
+<body class="dark-theme">
+    <div class="full-body-container">
+        <div class="top-text">
+            <img src="{{ url_for('static', filename='images/logo.png') }}" alt="Logo" style="width:120px">
+            <div class="input-box">
+                <img src="{{ url_for('static', filename='images/mag.png') }}" alt="Search">
+                <input id="filter-text-val" placeholder="Search for a Twitch streamer" onkeyup="filterText()">
+            </div>
+            <div class="size-filter">
+                <label for="category-filter">Size:</label>
+                <select id="category-filter" onchange="filterText()">
+                    <option value="all">All</option>
+                    <option value="big">Big (&gt;20,000 avg)</option>
+                    <option value="medium">Medium (10,000–20,000)</option>
+                    <option value="small">Small (&lt;10,000)</option>
+                </select>
+            </div>
+        </div>
+        <div id="answer-box"></div>
+    </div>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const themeSwitch = document.getElementById('theme-switch');
+            // No explicit theme switch element here; implement if needed
+        });
+        function filterText() {
+            const box = document.getElementById('answer-box');
+            box.innerHTML = '';
+            const term = document.getElementById('filter-text-val').value;
+            const category = document.getElementById('category-filter').value;
+            if (!term.trim()) return;
+            const params = new URLSearchParams({ name: term });
+            if (category && category !== 'all') params.append('category', category);
+            fetch('/search?' + params)
+                .then(r => r.json())
+                .then(data => {
+                    if (!data.length) {
+                        box.innerHTML = '<div class="no-results">No results found</div>';
+                        return;
+                    }
+                    data.forEach(s => {
+                        const card = document.createElement('div');
+                        card.className = 'streamer-card';
+                        let html = `<div class="streamer-header">
+                            <img src="/static/${s.image_path}" onerror="this.src='/static/images/placeholder.jpg'" class="streamer-image" alt="${s.name}">
+                            <div class="streamer-info">
+                                <h3>${s.name} (${s.category.toUpperCase()})</h3>
+                            </div>
+                        </div>`;
+                        html += '<div class="tt-summary">';
+                        if (s.twitchtracker && s.twitchtracker.avg_viewers) {
+                            html += `<p>Avg viewers: ${s.twitchtracker.avg_viewers.toLocaleString()}</p>`;
+                            html += `<p>Max viewers: ${s.twitchtracker.max_viewers.toLocaleString()}</p>`;
+                        } else {
+                            html += '<p>No 30-day data.</p>';
+                        }
+                        html += '</div>';
+                        if (s.documents.length) {
+                            html += '<div class="document-list">';
+                            s.documents.forEach(d => {
+                                html += `<div class="document-item"><p>${d.doc}</p><div class="meta-info"><span>Source: ${d.source}</span><span>Score: ${d.sim_score}</span></div></div>`;
+                            });
+                            html += '</div>';
+                        }
+                        card.innerHTML = html;
+                        box.appendChild(card);
+                    });
+                })
+                .catch(err => console.error(err));
+        }
+    </script>
 </body>
+</html>

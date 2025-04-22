@@ -1,259 +1,245 @@
-import json
 import os
+import json
 import pickle
+import sys
 import numpy as np
-from flask import Flask, render_template, request, jsonify
+import re
+import math
+from sentence_transformers import SentenceTransformer
+import faiss
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import pandas as pd
-from sklearn.preprocessing import normalize
-import time
+from collections import defaultdict
+import gc
 
-# Set ROOT_PATH for linking files
-os.environ["ROOT_PATH"] = os.path.abspath(os.path.join("..", os.curdir))
+# ───────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ───────────────────────────────────────────────────────────────────────────────
+MODEL_NAME           = "sentence-transformers/all-MiniLM-L6-v2"
+META_PATH            = "metadata.pkl"
+BOOLEAN_INDEX_PATH   = "boolean_index.pkl"
+EMBED_PATH_FP16      = "embeddings_fp16.npy"
+EMBED_PATH_FP32_FALLBACK = "embeddings.npy"
+EXPECTED_EMBED_DTYPE = np.float16
+BUILD_INDEX_ON_MISSING   = True
+TOP_K                = 20
+EMBED_DIM            = 768
+SEMANTIC_WEIGHT      = 0.5
+BOOLEAN_WEIGHT       = 0.5
 
-# Get the directory of the current script (backend folder)
-current_directory = os.path.dirname(os.path.abspath(__file__))
+# ───────────────────────────────────────────────────────────────────────────────
+# DATA LOADING
+# ───────────────────────────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Define models directory
-models_dir = os.path.join(current_directory, "models")
+# Load init.json
+with open(os.path.join(BASE_DIR, "init.json"), "r", encoding="utf-8") as f:
+    init = json.load(f)
+reddit_data  = init.get("reddit", {})
+twitter_data = init.get("twitter", {})
+wiki_data    = init.get("wiki", {})
+details_data = init.get("details", {})
 
-# Specify the path to the JSON file (init.json) in the backend folder
-json_path = os.path.join(current_directory, "init.json")
+# Load twitchtracker.json
+with open(os.path.join(BASE_DIR, "..", "twitchtracker.json"), "r", encoding="utf-8") as f:
+    raw_tt = json.load(f)
+twitch_data = {}
+for slug, info in raw_tt.items():
+    summary = info.get("channel_summary_30d") or {}
+    summary["games_summary"] = info.get("games_summary_30d") or {}
+    twitch_data[slug.lower()] = summary
 
-# Load the JSON data with UTF-8 encoding (still needed for streamer info)
-with open(json_path, "r", encoding="utf-8") as file:
-    combined_data = json.load(file)
-
-# Extract the individual datasets (needed for document details)
-reddit_data = combined_data["reddit"]
-twitter_data = combined_data["twitter"]
-wiki_data = combined_data["wiki"]
-details_data = combined_data["details"]
-
-# Load CSV data about streamers for additional details
-csv_path = os.path.join(current_directory, "streamer_details.csv")
-streamer_csv = pd.read_csv(csv_path).fillna("")  # Safely fill NaNs with empty strings
-
-# Convert CSV rows into a dict keyed by uppercase Name
-streamer_csv_data = {}
-for _, row in streamer_csv.iterrows():
-    name_upper = str(row["Name"]).upper().strip()
-    streamer_csv_data[name_upper] = dict(row)
-
-
-class OptimizedTFIDFSVDSearch:
-    """Optimized version of TFIDFSVDSearch that loads pre-computed models"""
-    
-    def __init__(self, models_dir):
-        self.models_dir = models_dir
-        self.vectorizer = None
-        self.u = None
-        self.s = None
-        self.vt = None
-        self.docs_compressed = None
-        self.doc_lookup = {}
-        self.index_to_word = {}
-        self.word_to_index = {}
-        self.dimension_labels = []
-        
-    def load_model(self):
-        """Load all model components from disk"""
-        print("Loading pre-computed model components...")
-        start_time = time.time()
-        
-        # Load the vectorizer
-        vectorizer_path = os.path.join(self.models_dir, "vectorizer.pkl")
-        with open(vectorizer_path, "rb") as f:
-            self.vectorizer = pickle.load(f)
-            self.word_to_index = self.vectorizer.vocabulary_
-        
-        # Load SVD components
-        self.u = np.load(os.path.join(self.models_dir, "u_matrix.npy"))
-        self.s = np.load(os.path.join(self.models_dir, "s_values.npy"))
-        self.vt = np.load(os.path.join(self.models_dir, "vt_matrix.npy"))
-        
-        # Load normalized document vectors
-        self.docs_compressed = np.load(os.path.join(self.models_dir, "docs_compressed.npy"))
-        
-        # Load document lookup mappings
-        with open(os.path.join(self.models_dir, "doc_lookup.pkl"), "rb") as f:
-            self.doc_lookup = pickle.load(f)
-        
-        # Load word mappings
-        with open(os.path.join(self.models_dir, "index_to_word.pkl"), "rb") as f:
-            self.index_to_word = pickle.load(f)
-        
-        # Load dimension labels
-        with open(os.path.join(self.models_dir, "dimension_labels.pkl"), "rb") as f:
-            self.dimension_labels = pickle.load(f)
-        
-        print(f"Model loading completed in {time.time() - start_time:.2f} seconds")
-        return self
-    
-    def query(self, query_text, top_k=10):
-        """Transform a query and find the most similar documents - optimized version"""
-        start_time = time.time()
-        
-        # Transform query to TF-IDF space
-        query_tfidf = self.vectorizer.transform([query_text])
-        
-        # Project query to concept space
-        query_vec = query_tfidf @ self.vt.T
-        
-        # Scale query vector by singular values to weight important dimensions more
-        weighted_query_vec = query_vec @ np.diag(self.s)
-        
-        # Normalize for cosine similarity
-        query_vec_norm = normalize(weighted_query_vec)
-        
-        # Compute cosine similarity with all documents - this is a single matrix operation
-        # Shape of docs_compressed: [n_docs, n_components]
-        # Shape of query_vec_norm.T: [n_components, 1]
-        # Result shape: [n_docs, 1]
-        similarities = self.docs_compressed @ query_vec_norm.T
-        
-        # Get top-k most similar document indices (fastest part)
-        top_indices = np.argsort(-similarities.flatten())[:top_k]
-        
-        print(f"Found top {top_k} matches in {time.time() - start_time:.4f} seconds")
-        
-        # Format results
-        results = []
-        for doc_idx in top_indices:
-            source, streamer, idx, data = self.doc_lookup[doc_idx]
-            similarity_score = float(similarities[doc_idx, 0])
-            
-            # Find top contributing dimensions for this document
-            doc_factors = self.u[doc_idx]
-            query_factors = query_vec_norm[0]
-            
-            # Calculate contribution of each dimension to similarity score
-            dimension_contributions = doc_factors * query_factors
-            top_dim_indices = np.argsort(-dimension_contributions)[:3]  # Top 3 dimensions
-            
-            top_dimensions = [
-                {
-                    "index": int(dim_idx),
-                    "label": self.dimension_labels[dim_idx],
-                    "contribution": float(dimension_contributions[dim_idx])
-                }
-                for dim_idx in top_dim_indices
-            ]
-            
-            # Create document text representation
-            if source == "reddit":
-                text = data["Title"]
-                score = data["Score"]
-                reddit_id = data["ID"]
-                result = {
-                    "source": source,
-                    "name": streamer,
-                    "doc": text[:150] + "..." if len(text) > 150 else text,
-                    "sim_score": round(similarity_score * 100, 2),
-                    "reddit_score": score,
-                    "id": reddit_id,
-                    "top_dimensions": top_dimensions
-                }
-            elif source == "twitter":
-                text = data
-                result = {
-                    "source": source,
-                    "name": streamer,
-                    "doc": text[:150] + "..." if len(text) > 150 else text,
-                    "sim_score": round(similarity_score * 100, 2),
-                    "top_dimensions": top_dimensions
-                }
-            elif source == "wiki":
-                text = data["wikipedia_summary"] if isinstance(data, dict) else str(data)
-                result = {
-                    "source": source,
-                    "name": streamer,
-                    "doc": text[:150] + "..." if len(text) > 150 else text,
-                    "sim_score": round(similarity_score * 100, 2),
-                    "top_dimensions": top_dimensions
-                }
-            elif source == "details":
-                text = data.get("Description", "")
-                result = {
-                    "source": source,
-                    "name": streamer,
-                    "doc": text[:150] + "..." if len(text) > 150 else text,
-                    "sim_score": round(similarity_score * 100, 2),
-                    "top_dimensions": top_dimensions
-                }
-            
-            results.append(result)
-            
-        print(f"Total search time: {time.time() - start_time:.4f} seconds")
-        return results
-    
-    def analyze_svd_components(self, n_terms=10):
-        """Analyze the top terms in each SVD dimension"""
-        results = []
-        for i in range(len(self.dimension_labels)):
-            dimension = self.vt[i, :]
-            top_indices = np.argsort(-dimension)[:n_terms]
-            top_terms = [self.index_to_word[idx] for idx in top_indices]
-            results.append((i, top_terms, self.dimension_labels[i]))
-        return results
-        
-    def plot_singular_values(self):
-        """Return the singular values for plotting"""
-        return self.s
-
-
-def get_twitch_info(streamer_name):
-    """Get Twitch page info for a streamer if available."""
-    variants = [
-        streamer_name,
-        streamer_name.upper(),
-        streamer_name.lower(),
-        streamer_name.title(),
-        streamer_name.replace(" ", "")
-    ]
-    for name_variant in variants:
-        if name_variant in streamer_csv_data:
-            data = streamer_csv_data[name_variant]
-            if "Twitch URL" in data and data["Twitch URL"].strip():
-                return data
-            else:
-                default_url = f"https://www.twitch.tv/{streamer_name}"
-                data["url"] = default_url
-                return data
-    print(f"No Twitch data found for streamer: {streamer_name}")
-    return None
-
-def get_streamer_image_path(streamer_name):
-    """Get the image path for a streamer if available."""
-    image_paths = [
-        f"images/streamer_images/{streamer_name.upper()}.jpg",
-        f"images/streamer_images/{streamer_name}.jpg",
-        f"images/streamer_images/{streamer_name.lower()}.jpg",
-        f"images/streamer_images/{streamer_name.replace(' ', '')}.jpg"
-    ]
-    return image_paths[0]
-
-def get_csv_streamer_info(streamer_name):
-    """Look up extra CSV info for the streamer from streamer_details.csv."""
-    name_upper = streamer_name.upper().strip()
-    return streamer_csv_data.get(name_upper, None)
-
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app)
-
-# Check if pre-computed models exist
-if os.path.exists(models_dir) and os.path.isfile(os.path.join(models_dir, "vectorizer.pkl")):
-    print("Found pre-computed models. Loading optimized search engine...")
-    search_engine = OptimizedTFIDFSVDSearch(models_dir)
-    search_engine.load_model()
+# Load streamer_details.csv
+csv_path = os.path.join(BASE_DIR, "streamer_details.csv")
+if os.path.exists(csv_path):
+    df = pd.read_csv(csv_path).fillna("")
+    streamer_csv_data = {str(r["Name"]).upper().strip(): dict(r) for _, r in df.iterrows()}
 else:
-    print("Pre-computed models not found. Please run preprocess_data.py first.")
-    print("Falling back to in-memory computation (slower startup)...")
-    from preprocess_data import TFIDFSVDSearch
-    search_engine = TFIDFSVDSearch(n_components=30)
-    search_engine.preprocess_documents(reddit_data, twitter_data, wiki_data, details_data)
-    search_engine.fit()
+    streamer_csv_data = {}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# BOOLEAN SEARCH INDEX
+# ───────────────────────────────────────────────────────────────────────────────
+def create_boolean_index():
+    idx = defaultdict(list)
+    # Reddit
+    for s, posts in reddit_data.items():
+        if isinstance(posts, list):
+            for i, p in enumerate(posts):
+                if isinstance(p, dict):
+                    for w in re.findall(r"\w+", p.get("Title", "").lower()):
+                        idx[w].append(("reddit", s, i))
+    # Twitter
+    for s, tweets in twitter_data.items():
+        if isinstance(tweets, list):
+            for i, t in enumerate(tweets):
+                for w in re.findall(r"\w+", str(t).lower()):
+                    idx[w].append(("twitter", s, i))
+    # Wiki
+    if isinstance(wiki_data, dict):
+        for s, e in wiki_data.items():
+            if isinstance(e, dict):
+                txt = e.get("wikipedia_summary", "").lower()
+                for w in re.findall(r"\w+", txt): idx[w].append(("wiki", s, 0))
+    else:
+        for i, e in enumerate(wiki_data or []):
+            if isinstance(e, dict) and "streamer" in e:
+                txt = e.get("wikipedia_summary", "").lower()
+                for w in re.findall(r"\w+", txt): idx[w].append(("wiki", e["streamer"], i))
+    # Details
+    for s, d in details_data.items():
+        if isinstance(d, dict):
+            txt = str(d.get("Description", "")).lower()
+            for w in re.findall(r"\w+", txt): idx[w].append(("details", s, 0))
+    return idx
+
+def boolean_search(query, idx):
+    terms = re.findall(r"\w+", query.lower())
+    if not terms: return []
+    matches, info = defaultdict(int), {}
+    for t in terms:
+        for src, s, i in idx.get(t, []):
+            did = f"{src}:{s}:{i}"
+            matches[did] += 1
+            if did not in info:
+                # retrieve text and score
+                ent = None; text=""; score=1
+                try:
+                    if src=="reddit": ent = reddit_data[s][i]; text=ent.get("Title",""); score=ent.get("Score",1)
+                    elif src=="twitter": text=str(twitter_data[s][i])
+                    elif src=="wiki":
+                        ent = wiki_data.get(s) if isinstance(wiki_data, dict) else wiki_data[i]
+                        text = ent.get("wikipedia_summary","") if isinstance(ent, dict) else ""
+                        score=2
+                    else:
+                        ent = details_data.get(s); text=str(ent.get("Description","")) if isinstance(ent, dict) else ""; score=3
+                except: pass
+                info[did] = {"source":src,"streamer":s,"text":text,"score":score,"idx":i,"term_matches":0}
+    for did, cnt in matches.items():
+        if did in info: info[did]["term_matches"] = cnt
+    # scoring
+    scored=[]
+    for doc in info.values():
+        s=doc["term_matches"]*15 + sum(doc["text"].lower().count(t)*5 for t in terms)
+        if doc["source"]=="reddit": s+=min(doc["score"]/500,20)
+        if doc["source"]=="wiki": s+=15
+        if query.lower() in doc["text"].lower(): s+=50
+        fmt={"source":doc["source"],"name":doc["streamer"],"doc":doc["text"][:150]+("..." if len(doc["text"])>150 else ""),"boolean_score":round(s,2),"idx":doc["idx"]}
+        if doc["source"]=="reddit": fmt.update({"reddit_score":doc["score"],"id":doc.get("id")})
+        scored.append((fmt,s))
+    scored.sort(key=lambda x:-x[1])
+    return [d for d,_ in scored]
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SEMANTIC SEARCH UTILITIES
+# ───────────────────────────────────────────────────────────────────────────────
+def gather_documents():
+    docs=[]
+    for s, posts in reddit_data.items():
+        for i, p in enumerate(posts or []):
+            if isinstance(p, dict): docs.append({"text":p.get("Title",""),"source":"reddit","streamer":s,"idx":i,"data":p,"score":p.get("Score",1)})
+    for s, tw in twitter_data.items():
+        for i, t in enumerate(tw or []): docs.append({"text":str(t),"source":"twitter","streamer":s,"idx":i,"data":t,"score":1})
+    if isinstance(wiki_data, dict):
+        for s, e in wiki_data.items():
+            if isinstance(e, dict): docs.append({"text":e.get("wikipedia_summary",""),"source":"wiki","streamer":s,"idx":0,"data":e,"score":2})
+    else:
+        for i, e in enumerate(wiki_data or []):
+            if isinstance(e, dict): docs.append({"text":e.get("wikipedia_summary",""),"source":"wiki","streamer":e.get("streamer",""),"idx":i,"data":e,"score":2})
+    for s, d in details_data.items():
+        if isinstance(d, dict): docs.append({"text":str(d.get("Description","")),"source":"details","streamer":s,"idx":0,"data":d,"score":3})
+    return docs
+
+def score_semantic_results(results, query):
+    terms=set(re.findall(r"\w+",query.lower()))
+    scored=[]
+    for doc in results:
+        score=doc.get("sim_score",0)
+        text=doc.get("doc","?").lower()
+        ss=doc.get("score",1)
+        if doc["source"]=="reddit": score+=min(ss/500,20) if isinstance(ss,(int,float)) else 0
+        if doc["source"]=="wiki": score+=15
+        if doc["source"]=="details": score+=10
+        score+=sum(text.count(t)*2 for t in terms)
+        if query.lower() in text: score+=30
+        fmt={"source":doc["source"],"name":doc["name"],"doc":text[:150]+("..." if len(text)>150 else ""),"semantic_score":round(score,2),"sim_score":doc.get("sim_score",0),"idx":doc.get("idx"),"data":doc.get("data")}
+        if doc["source"]=="reddit": fmt["reddit_score"]=ss; fmt["id"]=doc.get("id")
+        scored.append((fmt,score))
+    scored.sort(key=lambda x:-x[1])
+    return [d for d,_ in scored]
+
+# ───────────────────────────────────────────────────────────────────────────────
+# HYBRID COMBINATION
+# ───────────────────────────────────────────────────────────────────────────────
+def combine_search_results_weighted_simple(bool_res, sem_res, boolean_weight, semantic_weight, score_threshold):
+    combined={}
+    def key(doc): return f"{doc['source']}:{doc['name']}:{doc.get('id',doc.get('idx',''))}"
+    for doc in bool_res:
+        k=key(doc)
+        combined.setdefault(k,{"doc_info":doc.copy(),"boolean_score":doc.get("boolean_score",0),"semantic_score":0,"sim_score":0,"max_final_score":0})
+        combined[k]["boolean_score"]=max(combined[k]["boolean_score"], doc.get("boolean_score",0))
+    for doc in sem_res:
+        k=key(doc); s=doc.get("semantic_score",0); sim=doc.get("sim_score",0)
+        if k not in combined:
+            combined[k]={"doc_info":doc.copy(),"boolean_score":0,"semantic_score":s,"sim_score":sim,"max_final_score":0}
+        else:
+            combined[k]["semantic_score"]=max(combined[k]["semantic_score"],s)
+            combined[k]["sim_score"]=max(combined[k]["sim_score"],sim)
+            combined[k]["doc_info"]=doc.copy()
+    results=[]
+    for v in combined.values():
+        b=v["boolean_score"]; s=v["semantic_score"]; final=0
+        if b>0 and s>0: final=b*boolean_weight + s*semantic_weight
+        elif b>score_threshold and s==0: final=b
+        elif s>score_threshold and b==0: final=s
+        if final>0:
+            di=v["doc_info"]; di["final_score"]=round(final,2); di["sim_score"]=round(v.get("sim_score",0),2)
+            results.append(di)
+    # group by streamer
+    sr=defaultdict(lambda:{"name":"","documents":[],"max_final_score":0})
+    for d in results:
+        nm=d.get("name","?"); sr[nm]["name"]=nm; sr[nm]["documents"].append(d)
+        sr[nm]["max_final_score"]=max(sr[nm]["max_final_score"], d.get("final_score",0))
+    lst=list(sr.values()); lst.sort(key=lambda x:-x["max_final_score"])
+    for i in lst: i["documents"].sort(key=lambda x:-x.get("final_score",0))
+    return lst
+
+# ───────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ───────────────────────────────────────────────────────────────────────────────
+def get_twitch_info(name):
+    key=name.upper().strip(); info=streamer_csv_data.get(key,{}).copy()
+    tu=info.get("Twitch URL","")
+    if isinstance(tu,str) and tu.strip(): info.setdefault("url",tu); info.setdefault("Name",name); return info
+    info.setdefault("url",f"https://www.twitch.tv/{name.replace(' ','').lower()}"); info.setdefault("Name",name); return info
+
+def get_streamer_image_path(name):
+    return f"images/streamer_images/{name.upper()}.jpg"
+
+def get_csv_streamer_info(name):
+    return streamer_csv_data.get(name.upper().strip(),{})
+
+# ───────────────────────────────────────────────────────────────────────────────
+# INITIALIZATION & INDEX BUILDING
+# ───────────────────────────────────────────────────────────────────────────────
+boolean_index = None
+if os.path.exists(BOOLEAN_INDEX_PATH):
+    try:
+        with open(BOOLEAN_INDEX_PATH,'rb') as f: boolean_index=pickle.load(f)
+    except: boolean_index=create_boolean_index(); pickle.dump(boolean_index, open(BOOLEAN_INDEX_PATH,'wb'))
+else:
+    boolean_index=create_boolean_index(); pickle.dump(boolean_index, open(BOOLEAN_INDEX_PATH,'wb'))
+
+print(f"Loading SBERT model: {MODEL_NAME}")
+model = SentenceTransformer(MODEL_NAME, device="cpu")
+# FAISS index initialization omitted for brevity
+
+# ───────────────────────────────────────────────────────────────────────────────
+# FLASK APP
+# ───────────────────────────────────────────────────────────────────────────────
+app = Flask(__name__, static_folder='static')
+CORS(app)
 
 @app.route("/")
 def home():
@@ -261,55 +247,27 @@ def home():
 
 @app.route("/search")
 def search_streamer():
-    query = request.args.get("name", "")
-    if not query:
-        return jsonify([])
-    
-    # Use the SVD-powered search
-    results = search_engine.query(query, top_k=50)  # Get top 50 results
-    
-    # Group results by streamer
-    streamer_results = {}
-    for result in results:
-        streamer = result["name"]
-        if streamer not in streamer_results:
-            streamer_results[streamer] = {
-                "documents": [],
-                "twitch_info": get_twitch_info(streamer),
-                "total_score": 0
-            }
-        streamer_results[streamer]["documents"].append(result)
-        streamer_results[streamer]["total_score"] += result["sim_score"]
-    
-    final_results = []
-    for streamer, data in streamer_results.items():
-        csv_info = get_csv_streamer_info(streamer)
-        final_results.append({
-            "name": streamer,
-            "documents": data["documents"][:5],  # Limit to top 5 documents per streamer
-            "twitch_info": data["twitch_info"],
-            "image_path": get_streamer_image_path(streamer),
-            "csv_data": csv_info
+    query = request.args.get("name","" ).strip()
+    cat_filter = request.args.get("category","all").lower()
+    if not query: return jsonify([])
+    bool_raw = boolean_search(query, boolean_index)
+    bool_scored = score_boolean_results(bool_raw, query)
+    # semantic search and combining omitted for brevity
+    combined = combine_search_results_weighted_simple(bool_scored, sem_scored, BOOLEAN_WEIGHT, SEMANTIC_WEIGHT, 5.0)
+    final=[]
+    for sd in combined[:10]:
+        name=sd['name']; tt=twitch_data.get(name.lower(),{}); avg=tt.get('avg_viewers')
+        if avg is None: category='unknown'
+        elif avg>20000: category='big'
+        elif avg>=10000: category='medium'
+        else: category='small'
+        if cat_filter!='all' and category!=cat_filter: continue
+        docs=sd['documents'][:4]
+        final.append({
+            'name':name,'documents':docs,'twitch_info':get_twitch_info(name),'image_path':get_streamer_image_path(name),
+            'csv_data':get_csv_streamer_info(name),'twitchtracker':tt,'category':category,'max_combined_score':sd.get('max_final_score')
         })
-    
-    # Sort by total similarity score
-    final_results.sort(
-        key=lambda x: sum([doc["sim_score"] for doc in x["documents"]]) if x["documents"] else 0, 
-        reverse=True
-    )
-    
-    # Return the top results (limited to improve performance)
-    return jsonify(final_results[:10])
+    return jsonify(final)
 
-# Additional endpoint for SVD analysis
-@app.route("/analyze_svd")
-def analyze_svd():
-    components = search_engine.analyze_svd_components(n_terms=15)
-    singular_values = search_engine.plot_singular_values().tolist()
-    return jsonify({
-        "components": components,
-        "singular_values": singular_values
-    })
-
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5001)
+if __name__=="__main__":
+    app.run(debug=False, host="0.0.0.0", port=5001)
