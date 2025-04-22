@@ -16,7 +16,7 @@ import math # Import math for isnan/isinf checks
 # ───────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ───────────────────────────────────────────────────────────────────────────────
-MODEL_NAME   = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL_NAME   = "sentence-transformers/all-MiniLM-L12-v2"
 META_PATH    = "metadata.pkl"
 BOOLEAN_INDEX_PATH = "boolean_index.pkl"
 

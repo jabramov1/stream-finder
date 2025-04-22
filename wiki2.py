@@ -1,169 +1,216 @@
 import time
 import json
-import pandas as pd
 import requests
+import random
+import urllib.parse
+import pandas as pd
 from bs4 import BeautifulSoup
 from googlesearch import search
-import random
 
-# List of banned URL substrings for social media and non-encyclopedic content.
+# --- Constants ---
+INPUT_CSV = "top_1000_streamers.csv"
+OUTPUT_JSON = "wikitest.json"
 BAD_URL_SUBSTRINGS = [
-    "instagram.com",
-    "tiktok.com",
-    "twitch.tv",
-    "x.com",
-    "reddit.com",
-    "facebook.com",
-    "youtube.com",  # Optionally, you can ban YouTube if you don't want video pages.
-    "twitter.com"   # Sometimes Twitter may show up too.
+    "fandom.com", "wikia.com", "facebook.com", "twitter.com",
+    "youtube.com", "instagram.com", "twitch.tv", "reddit.com",
+    "tiktok.com", "discord.com", "google.com", "amazon.com",
+    "/song)", "(song)", "/album)", "(album)", "/film)", "(film)"
 ]
-# Explicitly banned Twitch Wikipedia page.
-BAD_WIKI_LINK = "https://en.wikipedia.org/wiki/Twitch_(service)"
 
+# --- Helper Functions ---
 def is_bad_url(url):
-    """Return True if the URL is from a banned domain or is the banned Twitch Wikipedia page."""
-    for bad_substring in BAD_URL_SUBSTRINGS:
-        if bad_substring in url:
-            return True
-    if url.strip().lower() == BAD_WIKI_LINK.lower():
-        return True
-    return False
-
-def read_streamers_from_csv(file_path="top_1000_twitch.csv"):
-    """Read streamer names from CSV file."""
-    try:
-        df = pd.read_csv(file_path)
-        return df["Name"].tolist()
-    except FileNotFoundError:
-        print(f"Error: {file_path} not found.")
-        return []
-    except Exception as e:
-        print(f"Error reading CSV: {e}")
-        return []
+    """Check if URL should be skipped."""
+    url_lower = url.lower()
+    return any(bad in url_lower for bad in BAD_URL_SUBSTRINGS)
 
 def format_streamer_name(name):
-    """Format streamer name for better matching."""
-    return name.replace("_", " ").title()
+    """Clean streamer name formatting."""
+    return name.strip().replace("_", " ").title()
 
-def random_user_agent():
-    """Return a random user agent string from a sample list."""
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:89.0) Gecko/20100101 Firefox/89.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0"
-    ]
-    return random.choice(user_agents)
+def fetch_page_content(url, timeout=15):
+    """Fetch raw HTML from a URL with retries."""
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    for _ in range(3):  # Retry up to 3 times
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            return response.text
+        except Exception as e:
+            print(f"Retry failed for {url}: {str(e)}")
+            time.sleep(random.uniform(1, 3))
+    return f"Error: Failed to fetch {url}"
 
-def fetch_page_content(url, timeout=10):
-    """Attempt to scrape full content from a given URL using a random user agent."""
-    try:
-        headers = {'User-Agent': random_user_agent()}
-        response = requests.get(url, headers=headers, timeout=timeout)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-        content = soup.get_text(separator='\n', strip=True)
-        return content  # Return full content with no slicing.
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-def fetch_google_scrapable_content(streamer_name, max_results=5):
-    """
-    Search Google using the query "[streamer name] twitch wikipedia" and check each result sequentially.
-    Return the first scrapable page that is not from a banned domain.
-    """
-    query = f"{streamer_name} twitch wikipedia"
-    delay_before = random.randint(2, 5)
-    print(f"Waiting {delay_before} seconds before performing Google search for {streamer_name}...")
-    time.sleep(delay_before)
+def clean_wiki_content(html):
+    """Extract clean text from Wikipedia HTML."""
+    soup = BeautifulSoup(html, 'html.parser')
     
-    for url in search(query, num_results=max_results):
-        if is_bad_url(url):
-            print(f"Skipping banned URL: {url}")
-            continue
+    # Remove Wikipedia-specific junk
+    for element in soup(['sup', 'table', 'div.hatnote', 'div.infobox',
+                        'span.mw-editsection', 'div.navbox', 'style',
+                        'script', 'link', 'meta', 'img', 'footer']):
+        element.decompose()
+    
+    # Get main content
+    content = soup.find('div', {'id': 'mw-content-text'}) or soup.body
+    if not content:
+        return "No content found"
+    
+    # Clean and structure text
+    paragraphs = []
+    for element in content.find_all(['p', 'h2', 'h3']):
+        text = element.get_text().strip()
+        if element.name in ['h2', 'h3']:
+            paragraphs.append(f"\n\n{text.upper()}\n{'-'*len(text)}")
+        elif text:
+            paragraphs.append(text)
+    
+    return "\n".join(paragraphs) or "No readable content extracted"
 
-        time.sleep(random.uniform(1, 3))
-        print(f"Attempting to scrape URL: {url}")
-        content = fetch_page_content(url)
-        if not content.startswith("Error:"):
-            print(f"Success with URL: {url}")
+# --- Wikipedia API Functions ---
+def fetch_wikipedia_content(page_title, lang='en'):
+    """Get complete Wikipedia article content through API."""
+    api_url = f"https://{lang}.wikipedia.org/w/api.php"
+    params = {
+        'action': 'query',
+        'prop': 'extracts|info',
+        'explaintext': True,
+        'exsectionformat': 'plain',
+        'inprop': 'url',
+        'titles': page_title,
+        'format': 'json'
+    }
+    
+    try:
+        response = requests.get(api_url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        pages = data.get('query', {}).get('pages', {})
+        
+        for page in pages.values():
             return {
-                "url": url,
-                "content": content,
-                "source": "Google Search"
+                'content': page.get('extract', ''),
+                'url': page.get('fullurl', ''),
+                'language': lang
+            }
+    except Exception as e:
+        print(f"Wikipedia API error ({lang}): {e}")
+    return None
+
+# --- Streamer Verification ---
+def is_streamer_page(url, streamer_name):
+    """Verify the page is about the streamer and not something else."""
+    # Skip obvious non-streamer pages
+    if any(x in url.lower() for x in ['/song', '/album', '/film', '/music']):
+        return False
+        
+    # Check title matches streamer name
+    page_title = urllib.parse.unquote(url.split('/wiki/')[-1].replace('_', ' '))
+    return (streamer_name.lower() in page_title.lower() and
+            'disambiguation' not in page_title.lower())
+
+# --- Core Processing ---
+def read_streamers_from_csv():
+    """Read streamers from specified CSV file."""
+    try:
+        df = pd.read_csv(INPUT_CSV)
+        # Handle different CSV formats
+        if 'Name' in df.columns:
+            return df['Name'].dropna().unique().tolist()
+        elif 'streamer' in df.columns:
+            return df['streamer'].dropna().unique().tolist()
+        else:
+            return df.iloc[:, 1].dropna().unique().tolist()  # Assume 2nd column
+    except Exception as e:
+        print(f"CSV reading error: {e}")
+        return []
+
+def process_streamer(streamer_name):
+    """Full processing pipeline for one streamer."""
+    print(f"\nProcessing {streamer_name}...")
+    
+    # Step 1: Find Wikipedia page using optimized query
+    query = f"{streamer_name} twitch wikipedia"
+    wiki_url = None
+    lang = 'en'
+    
+    for url in search(query, num_results=3, lang='en'):
+        if is_bad_url(url) or not is_streamer_page(url, streamer_name):
+            continue
+            
+        if '.wikipedia.org/wiki/' in url:
+            lang = url.split('.wikipedia.org')[0].split('//')[-1]
+            wiki_url = url
+            break
+        time.sleep(random.uniform(1, 2))
+    
+    if not wiki_url:
+        print(f"No valid Wikipedia page found for {streamer_name}")
+        return None
+    
+    # Step 2: Fetch content
+    page_title = urllib.parse.unquote(wiki_url.split('/wiki/')[-1])
+    wiki_data = fetch_wikipedia_content(page_title, lang)
+    
+    if not wiki_data or not wiki_data['content']:
+        print(f"API failed, scraping directly: {wiki_url}")
+        html = fetch_page_content(wiki_url)
+        if not html.startswith("Error"):
+            wiki_data = {
+                'content': clean_wiki_content(html),
+                'url': wiki_url,
+                'language': lang
             }
         else:
-            print(f"URL {url} not scrapable, trying next result...")
+            return None
     
     return {
-        "url": "",
-        "content": "",
-        "source": "Google Search"
+        'streamer': streamer_name,
+        'formatted_name': format_streamer_name(streamer_name),
+        'content': wiki_data['content'],
+        'url': wiki_data['url'],
+        'language': lang,
+        'source': 'Wikipedia',
+        'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
-def update_json_file(data, filename):
-    """Write data to a JSON file."""
-    try:
-        with open(filename, "w", encoding="utf-8") as json_file:
-            json.dump(data, json_file, ensure_ascii=False, indent=4)
-    except Exception as e:
-        print(f"Error updating {filename}: {e}")
-
-def load_json_file(filename):
-    """Load data from a JSON file, or return an empty dict if missing or invalid."""
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def compile_streamer_wikipedia():
-    """Process each streamer and update wikipage2.json accordingly."""
+def main():
+    """Main execution function."""
+    print(f"Reading streamers from {INPUT_CSV}...")
     streamers = read_streamers_from_csv()
     if not streamers:
-        print("No streamers found to process.")
+        print("No streamers found in CSV!")
         return
-
-    # Reprocess every streamer.
-    wiki_data = load_json_file("wikipage2.json")
     
+    print(f"Found {len(streamers)} streamers to process")
+    
+    # Load existing data
+    try:
+        with open(OUTPUT_JSON, 'r', encoding='utf-8') as f:
+            existing_data = json.load(f)
+        print(f"Resuming with {len(existing_data)} existing records")
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing_data = {}
+    
+    # Process streamers in order
     for i, streamer in enumerate(streamers, 1):
-        print(f"Processing {streamer} ({i}/{len(streamers)})...")
-        formatted = format_streamer_name(streamer)
+        if streamer in existing_data:
+            print(f"{i}/{len(streamers)}: Skipping {streamer} (already processed)")
+            continue
+            
+        result = process_streamer(streamer)
+        if result:
+            existing_data[streamer] = result
+            # Save after each successful processing
+            with open(OUTPUT_JSON, 'w', encoding='utf-8') as f:
+                json.dump(existing_data, f, indent=2, ensure_ascii=False)
+            print(f"{i}/{len(streamers)}: Saved {streamer} to {OUTPUT_JSON}")
         
-        result = fetch_google_scrapable_content(streamer)
-        if result["url"]:
-            wiki_entry = {
-                "streamer": streamer,
-                "formatted_name": formatted,
-                "wikipedia_summary": result["content"],
-                "link": result["url"],
-                "source": result["source"]
-            }
-        else:
-            wiki_entry = {
-                "streamer": streamer,
-                "formatted_name": formatted,
-                "wikipedia_summary": "Failed to retrieve page.",
-                "link": "",
-                "source": ""
-            }
-        
-        # Overwrite any existing entry for this streamer.
-        wiki_data[streamer] = wiki_entry
-        update_json_file(wiki_data, "wikipage2.json")
-        print(f"Updated wikipage2.json for {streamer}.")
-        
-        delay = random.randint(5, 15)
-        print(f"Waiting for {delay} seconds before next streamer...")
+        # Respectful delay with progress tracking
+        delay = random.uniform(3, 8)
+        print(f"Waiting {delay:.1f}s...")
         time.sleep(delay)
     
-    print("Processing complete. Data saved to wikipage2.json.")
+    print("\nProcessing complete!")
 
 if __name__ == "__main__":
-    try:
-        compile_streamer_wikipedia()
-    except KeyboardInterrupt:
-        print("\nScript interrupted by user.")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
+    main()
