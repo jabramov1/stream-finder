@@ -665,4 +665,4 @@ if __name__ == "__main__":
     if boolean_index is None or index is None or model is None or not DOCS:
         print("Error: Indexes or model not loaded properly. Exiting."); sys.exit(1)
     print("\n--- Starting Flask Server ---")
-    app.run(debug=False, host="0.0.0.0", port=5001) #1
+    app.run(debug=False, host="0.0.0.0", port=5001) #
