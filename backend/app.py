@@ -580,4 +580,4 @@ if __name__ == "__main__":
     # 5) Show the shell’s PATH variable
     print("ENV PATH =", os.environ.get("PATH", ""))
 
-    app.run(debug=False, host="0.0.0.0", port=5001)
+    app.run(debug=False, host="0.0.0.0", port=5000)
