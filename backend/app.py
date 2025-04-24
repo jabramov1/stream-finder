@@ -1,520 +1,701 @@
-import os, json, pickle, sys, numpy as np, re
-from sentence_transformers import SentenceTransformer
-import faiss, torch
-from flask import Flask, request, jsonify, render_template
+import json
+import os
+import pickle
+import numpy as np
+from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 import pandas as pd
+import time
 from collections import defaultdict
-import gc
-from tqdm import tqdm
+import re
+import logging
+from gensim.models import KeyedVectors
+from gensim.models.keyedvectors import Word2VecKeyedVectors
+from sklearn.preprocessing import normalize
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                   format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-print("👋 app.py launched", flush=True)
-app_dir = os.path.abspath(os.path.dirname(__file__))
-print("App directory:", app_dir, flush=True)
+# Set ROOT_PATH for linking files
+os.environ["ROOT_PATH"] = os.path.abspath(os.path.join("..", os.curdir))
 
-# Filter out static folder when listing contents
-contents = [item for item in os.listdir(app_dir) if item != "static"]
-print("Contents:", contents, flush=True)
+# Get the directory of the current script (backend folder)
+current_directory = os.path.dirname(os.path.abspath(__file__))
 
-# Skip the static folder when walking through directories
-for root, _, files in os.walk(app_dir):
-    if "static" not in root:
-        for f in files:
-            print(os.path.join(root, f), flush=True)
+# ===== Configuration =====
+# Choose a smaller Word2Vec model
+MODEL_NAME = "glove-wiki-gigaword-300"  # or can use the much smaller glove-twitter-25 (must also change the below vector size as well to 25)
+VECTOR_SIZE = 300  # The dimension of this model
 
-print("sys.path =", sys.path, flush=True)
-print("ENV PATH =", os.environ.get("PATH", ""), flush=True)
+# Paths for stored data
+MODELS_DIR = os.path.join(current_directory, "models", "word2vec")
+WIKI_VECTORS_PATH = os.path.join(MODELS_DIR, f"wiki_doc_vectors_{VECTOR_SIZE}.npy")
+WIKI_LOOKUP_PATH = os.path.join(MODELS_DIR, f"wiki_doc_lookup_{VECTOR_SIZE}.pkl")
+MODEL_INFO_PATH = os.path.join(MODELS_DIR, "model_info.json")
+BOOLEAN_INDEX_PATH = os.path.join(MODELS_DIR, "boolean_index.pkl")
 
+# Search weights
+WIKI_SEMANTIC_WEIGHT = 0.5
+BOOLEAN_WEIGHT = 0.5
+TOP_K = 50  # Number of results to return from each search method
 
+# Ensure models directory exists
+os.makedirs(MODELS_DIR, exist_ok=True)
 
-# CONFIG
-MODEL_NAME             = "intfloat/e5-base-v2"
-EMBED_DIM, TOP_K       = 768, 25
-META_PATH              = "models/metadata.pkl"
-BOOLEAN_INDEX_PATH     = "models/boolean_index.pkl"
-EMBED_PATH             = "models/embeddings.npy"
-SEMANTIC_WEIGHT        = 0.5
-BOOLEAN_WEIGHT         = 0.5
-TWITCH_USERNAME_REGEX = r'^[a-z0-9_]{4,25}'
+# ===== Load Data =====
+# Define models directory
+models_dir = os.path.join(current_directory, "models")
 
-STOP_WORDS = {"the", "and", "a", "of", "to", "in", "is", "you", "that", "it", "was", "for", "on", "streamer"}
+# Specify the path to the JSON file (init.json) in the backend folder
+json_path = os.path.join(current_directory, "init.json")
 
-# LOAD DATA
-BACK = os.path.dirname(os.path.abspath(__file__))
 try:
-    with open(os.path.join(BACK, "init.json"), "r", encoding="utf-8") as f:
-        init = json.load(f)
-        reddit_data, twitter_data = init.get("reddit", {}), init.get("twitter", {})
-        wiki_data, details_data = init.get("wiki", {}), init.get("details", {})
+    # Load the JSON data with UTF-8 encoding (still needed for streamer info)
+    with open(json_path, "r", encoding="utf-8") as file:
+        combined_data = json.load(file)
+
+    # Extract the individual datasets (needed for document details)
+    reddit_data = combined_data["reddit"]
+    twitter_data = combined_data["twitter"]
+    wiki_data = combined_data["wiki"]
+    details_data = combined_data["details"]
 except Exception as e:
-    print(f"Error loading init.json: {e}. Exiting."); sys.exit(1)
+    logger.error(f"Failed to load init.json: {e}")
+    reddit_data = {}
+    twitter_data = {}
+    wiki_data = {}
+    details_data = {}
 
-# Load CSV data if available
-streamer_csv_data = {}
-print(f"Looking for embeddings at: {os.path.join(BACK, EMBED_PATH)}")
-print(f"Looking for metadata at: {os.path.join(BACK, META_PATH)}")
-print(f"Directory exists: {os.path.exists(BACK)}")
-if os.path.exists(CSV_PATH := os.path.join(BACK, "streamer_details.csv")):
-    try:
-        streamer_csv = pd.read_csv(CSV_PATH).fillna("")
-        streamer_csv_data = {str(r["Name"]).upper().strip(): dict(r) for _, r in streamer_csv.iterrows()}
-    except: pass
+try:
+    # Load CSV data about streamers for additional details
+    csv_path = os.path.join(current_directory, "streamer_details.csv")
+    streamer_csv = pd.read_csv(csv_path).fillna("")  # Safely fill NaNs with empty strings
 
-# HELPER FUNCTIONS
-def is_valid_username(name):
-    return bool(re.match(TWITCH_USERNAME_REGEX, name.lower().replace(' ', '')))
+    # Convert CSV rows into a dict keyed by uppercase Name
+    streamer_csv_data = {}
+    for _, row in streamer_csv.iterrows():
+        name_upper = str(row["Name"]).upper().strip()
+        streamer_csv_data[name_upper] = dict(row)
+except Exception as e:
+    logger.error(f"Failed to load streamer_details.csv: {e}")
+    streamer_csv_data = {}
 
-# At the top of your file, define:
-SOURCE_WEIGHT = {
-    "wiki":    2.0,   # double-weight wiki
-    "details": 1.5,   # 1.5× for your “details” section
-    "reddit":  1.0,   # default
-    "twitter": 1.0,   # default
-}
-
-def embed_streamer(full_text: str,
-                   chunk_size: int = 300,
-                   overlap:    int = 75,
-                   batch_size: int = 16) -> np.ndarray:
-    """
-    1) Slide a chunk_size-word window with `overlap` over full_text
-    2) SBERT-encode & normalize each window
-    3) Weight each window by (SOURCE_WEIGHT × window_length)
-    4) Softmax-pool → one EMBED_DIM vector
-    """
-    words = full_text.split()
-    if not words:
-        return np.zeros(EMBED_DIM, dtype=np.float32)
-
-    step = max(1, chunk_size - overlap)
-    windows, raw_w = [], []
-
-    # build windows & raw weights
-    for i in range(0, len(words), step):
-        w = " ".join(words[i : i + chunk_size])
-        if not w:
-            continue
-        windows.append(w)
-
-        # detect source label in your text if you prefix with e.g. "wiki:" or "reddit:"
-        src = w.split(":", 1)[0].lower()
-        bias = SOURCE_WEIGHT.get(src, 1.0)
-        raw_w.append(bias * len(w.split()))
-
-    # encode + normalize
-    embs = model.encode(
-        windows,
-        batch_size=batch_size,
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    )  # shape (n_windows, EMBED_DIM)
-
-    # softmax over raw_w → attention weights
-    r    = np.array(raw_w, dtype=np.float32)
-    exps = np.exp(r - r.max())
-    attn = exps / exps.sum()
-
-    # weighted mean + final normalize
-    vec = attn @ embs            # (EMBED_DIM,)
-    vec /= np.linalg.norm(vec) + 1e-8
-    return vec
-
-
-
-def split_text(text, min_len=100, max_len=600):
-    chunks, current = [], ""
-    for sent in re.split(r'(?<=[.!?])\s+', text):
-        if len(current) + len(sent) <= max_len:
-            current += " " + sent if current else sent
+# ===== Word2Vec Wiki Search =====
+class LightWord2VecSearch:
+    def __init__(self, model_name=MODEL_NAME, vector_size=VECTOR_SIZE):
+        """Initialize the Word2Vec search engine with a pre-trained model"""
+        self.model_name = model_name
+        self.vector_size = vector_size
+        self.word2vec_model = None
+        self.wiki_docs = []
+        self.doc_vectors = None
+        self.doc_lookup = {}  # Maps index to original document data
+        
+    def load_pretrained_model(self):
+        """Load a pre-trained Word2Vec model from Gensim"""
+        logger.info(f"Loading pre-trained Word2Vec model: {self.model_name}")
+        start_time = time.time()
+        
+        try:
+            # Import gensim.downloader only when needed
+            try:
+                import gensim.downloader as api
+                self.word2vec_model = api.load(self.model_name)
+                logger.info(f"Model loaded in {time.time() - start_time:.2f} seconds")
+                return True
+            except ImportError as e:
+                logger.error(f"Error importing gensim.downloader: {e}")
+                # Try creating a simple word vector model from scratch
+                self._create_simple_model()
+                return self.word2vec_model is not None
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            # Fallback to simple model
+            self._create_simple_model()
+            return self.word2vec_model is not None
+            
+    def _create_simple_model(self):
+        """Create a very simple word vector model from scratch using the documents"""
+        logger.info("Creating a simple word vector model from scratch")
+        
+        try:
+            # Extract documents
+            all_docs = []
+            
+            # Add wiki documents
+            if isinstance(wiki_data, dict):
+                for streamer, entry in wiki_data.items():
+                    if isinstance(entry, dict) and "content" in entry:
+                        all_docs.append(entry["content"])
+            elif isinstance(wiki_data, list):
+                for entry in wiki_data:
+                    if isinstance(entry, dict) and "content" in entry:
+                        all_docs.append(entry["content"])
+            
+            # Add other text sources for better vocabulary
+            for streamer, posts in reddit_data.items():
+                if isinstance(posts, list):
+                    for post in posts:
+                        if isinstance(post, dict) and "Title" in post:
+                            all_docs.append(post["Title"])
+            
+            # Tokenize documents
+            all_tokens = []
+            for doc in all_docs:
+                tokens = re.findall(r"\w+", doc.lower())
+                all_tokens.extend(tokens)
+            
+            # Count token frequencies
+            token_freq = {}
+            for token in all_tokens:
+                if token in token_freq:
+                    token_freq[token] += 1
+                else:
+                    token_freq[token] = 1
+            
+            # Keep only tokens that appear at least twice
+            vocab = {token: idx for idx, (token, freq) in enumerate(
+                sorted(token_freq.items(), key=lambda x: x[1], reverse=True)
+            ) if freq >= 2}
+            
+            # Create random vectors for each token
+            vectors = np.random.randn(len(vocab), self.vector_size).astype(np.float32)
+            vectors = normalize(vectors)
+            
+            # Create a simple Word2VecKeyedVectors object
+            model = Word2VecKeyedVectors(self.vector_size)
+            model.add_vectors(list(vocab.keys()), vectors)
+            
+            self.word2vec_model = model
+            logger.info(f"Created simple model with {len(vocab)} tokens")
+            return True
+        except Exception as e:
+            logger.error(f"Error creating simple model: {e}")
+            return False
+    
+    def extract_wiki_documents(self, wiki_data):
+        """Extract Wikipedia documents from the data"""
+        logger.info("Extracting Wikipedia documents")
+        
+        try:
+            doc_idx = 0
+            if isinstance(wiki_data, dict):
+                # Handle dictionary format
+                for streamer, entry in wiki_data.items():
+                    if isinstance(entry, dict) and "content" in entry:
+                        self.wiki_docs.append(entry["content"])
+                        self.doc_lookup[doc_idx] = {
+                            "source": "wiki", 
+                            "streamer": streamer, 
+                            "text": entry["content"]
+                        }
+                        doc_idx += 1
+            elif isinstance(wiki_data, list):
+                # Handle list format
+                for idx, entry in enumerate(wiki_data):
+                    if isinstance(entry, dict) and "content" in entry and "streamer" in entry:
+                        self.wiki_docs.append(entry["content"])
+                        self.doc_lookup[doc_idx] = {
+                            "source": "wiki", 
+                            "streamer": entry["streamer"], 
+                            "text": entry["content"]
+                        }
+                        doc_idx += 1
+            
+            logger.info(f"Extracted {len(self.wiki_docs)} Wikipedia documents")
+            return True
+        except Exception as e:
+            logger.error(f"Error extracting Wikipedia documents: {e}")
+            return False
+    
+    def compute_document_vectors(self):
+        """Compute document vectors by averaging word vectors"""
+        if not self.word2vec_model or not self.wiki_docs:
+            logger.error("Model or documents not loaded")
+            return False
+        
+        logger.info("Computing document vectors...")
+        start_time = time.time()
+        
+        # Initialize document vectors array
+        self.doc_vectors = np.zeros((len(self.wiki_docs), self.vector_size), dtype=np.float32)
+        
+        # Compute document vectors by averaging word vectors
+        for i, doc in enumerate(self.wiki_docs):
+            words = re.findall(r"\w+", doc.lower())
+            vectors = []
+            
+            for word in words:
+                try:
+                    if word in self.word2vec_model:
+                        vectors.append(self.word2vec_model[word])
+                except Exception as e:
+                    continue  # Skip words that cause errors
+            
+            if vectors:
+                doc_vector = np.mean(vectors, axis=0)
+                self.doc_vectors[i] = doc_vector
+        
+        # Normalize document vectors for cosine similarity
+        self.doc_vectors = normalize(self.doc_vectors)
+        
+        logger.info(f"Document vectors computed in {time.time() - start_time:.2f} seconds")
+        return True
+    
+    def save_model(self, directory):
+        """Save the computed document vectors, lookup table, and model info"""
+        os.makedirs(directory, exist_ok=True)
+        
+        # Save document vectors with dimension in filename
+        vectors_path = os.path.join(directory, f"wiki_doc_vectors_{self.vector_size}.npy")
+        np.save(vectors_path, self.doc_vectors)
+        
+        # Save document lookup table with dimension in filename
+        lookup_path = os.path.join(directory, f"wiki_doc_lookup_{self.vector_size}.pkl")
+        with open(lookup_path, "wb") as f:
+            pickle.dump(self.doc_lookup, f)
+        
+        # Save model info
+        model_info = {
+            "model_name": self.model_name,
+            "vector_size": self.vector_size,
+            "doc_count": len(self.wiki_docs),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "vectors_path": vectors_path,
+            "lookup_path": lookup_path
+        }
+        
+        with open(os.path.join(directory, "model_info.json"), "w") as f:
+            json.dump(model_info, f)
+        
+        logger.info(f"Model components saved to {directory} with dimension {self.vector_size}")
+        return True
+    
+    def load_model(self, directory):
+        """Load pre-computed document vectors and lookup table"""
+        # Construct paths with vector dimension
+        vectors_path = os.path.join(directory, f"wiki_doc_vectors_{self.vector_size}.npy")
+        lookup_path = os.path.join(directory, f"wiki_doc_lookup_{self.vector_size}.pkl")
+        
+        logger.info(f"Loading model components from {directory}")
+        start_time = time.time()
+        
+        try:
+            # Load document vectors
+            self.doc_vectors = np.load(vectors_path)
+            
+            # Load document lookup table
+            with open(lookup_path, "rb") as f:
+                self.doc_lookup = pickle.load(f)
+            
+            logger.info(f"Model components loaded in {time.time() - start_time:.2f} seconds")
+            
+            # Check if dimensions match
+            if self.doc_vectors.shape[1] != self.vector_size:
+                logger.warning(f"Dimension mismatch: loaded vectors have dimension {self.doc_vectors.shape[1]} but expected {self.vector_size}")
+                return False
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error loading model components: {e}")
+            return False
+    
+    def check_model_compatibility(self):
+        """Check if any existing model is compatible with current configuration"""
+        model_info_path = os.path.join(MODELS_DIR, "model_info.json")
+        
+        # Check if model info exists
+        if os.path.exists(model_info_path):
+            try:
+                with open(model_info_path, "r") as f:
+                    model_info = json.load(f)
+                
+                stored_size = model_info.get("vector_size")
+                stored_name = model_info.get("model_name")
+                
+                logger.info(f"Found existing model: {stored_name} with {stored_size} dimensions")
+                logger.info(f"Current configuration: {self.model_name} with {self.vector_size} dimensions")
+                
+                if stored_size == self.vector_size and stored_name == self.model_name:
+                    logger.info("Model configuration matches")
+                    return True
+                else:
+                    logger.info("Model configuration doesn't match")
+                    return False
+            except Exception as e:
+                logger.error(f"Error checking model info: {e}")
+                return False
         else:
-            if current and len(current) >= min_len: chunks.append(current)
-            current = sent
-    if current and len(current) >= min_len: chunks.append(current)
-    return chunks
+            logger.info("No existing model info found")
+            return False
+    
+    def rebuild_model_if_needed(self):
+        """Check if model needs to be rebuilt and rebuild if necessary"""
+        vectors_path = os.path.join(MODELS_DIR, f"wiki_doc_vectors_{self.vector_size}.npy")
+        lookup_path = os.path.join(MODELS_DIR, f"wiki_doc_lookup_{self.vector_size}.pkl")
+        
+        # Check if model files with correct dimensions already exist
+        if os.path.exists(vectors_path) and os.path.exists(lookup_path):
+            logger.info(f"Found model files with matching dimension {self.vector_size}")
+            return self.load_model(MODELS_DIR)
+        
+        # Check if any model exists but with wrong dimensions
+        if not self.check_model_compatibility():
+            logger.info("No matching model found, rebuilding...")
+            
+            # Load word2vec model
+            if not self.word2vec_model and not self.load_pretrained_model():
+                logger.error("Failed to load word2vec model")
+                return False
+            
+            # Extract documents
+            if not self.wiki_docs and not self.extract_wiki_documents(wiki_data):
+                logger.error("Failed to extract wiki documents")
+                return False
+            
+            # Compute document vectors
+            if not self.compute_document_vectors():
+                logger.error("Failed to compute document vectors")
+                return False
+            
+            # Save model with updated info
+            return self.save_model(MODELS_DIR)
+        
+        return True
+    
+    def query(self, query_text, top_k=TOP_K):
+        """Find the most similar documents to the query"""
+        if self.doc_vectors is None:
+            logger.error("Document vectors not loaded")
+            return []
+        
+        if self.word2vec_model is None:
+            logger.error("Word2Vec model not loaded")
+            return []
+        
+        start_time = time.time()
+        
+        # Get all the words from the query
+        words = re.findall(r"\w+", query_text.lower())
+        vectors = []
+        
+        for word in words:
+            try:
+                if word in self.word2vec_model:
+                    vectors.append(self.word2vec_model[word])
+            except Exception as e:
+                logger.warning(f"Error getting vector for word '{word}': {e}")
+                continue
+        
+        if not vectors:
+            # Fallback to boolean matching if no vectors
+            logger.warning("No word vectors found in query, falling back to boolean matching")
+            return self._boolean_fallback(query_text, top_k)
+        
+        # Compute average query vector
+        query_vector = np.mean(vectors, axis=0)
+        
+        # Normalize query vector
+        query_vector = query_vector / np.linalg.norm(query_vector)
+        
+        # Debug dimensions
+        logger.info(f"Query vector dimension: {query_vector.shape}, Document vectors dimension: {self.doc_vectors.shape}")
+        
+        # Compute cosine similarity with all documents
+        similarities = np.dot(self.doc_vectors, query_vector)
+        
+        # Get top-k most similar document indices
+        top_indices = np.argsort(-similarities)[:top_k]
+        
+        results = []
+        for idx in top_indices:
+            if idx >= len(self.doc_lookup):
+                continue
+                
+            doc_info = self.doc_lookup[idx]
+            similarity_score = float(similarities[idx])
+            
+            # Skip very low similarity scores
+            if similarity_score < 0.1:
+                continue
+                
+            results.append({
+                "source": doc_info["source"],
+                "name": doc_info["streamer"],
+                "doc": doc_info["text"][:150] + "..." if len(doc_info["text"]) > 150 else doc_info["text"],
+                "sim_score": round(similarity_score * 100, 2),
+                "semantic_score": round(similarity_score * 100, 2)
+            })
+        
+        # If we got no results, fall back to boolean matching
+        if not results:
+            logger.warning("No semantic results found, falling back to boolean matching")
+            return self._boolean_fallback(query_text, top_k)
+            
+        logger.info(f"Query processed in {time.time() - start_time:.4f} seconds")
+        return results
+        
+    def _boolean_fallback(self, query_text, top_k=TOP_K):
+        """Simple boolean search fallback if vector search fails"""
+        results = []
+        query_terms = set(re.findall(r"\w+", query_text.lower()))
+        
+        for idx, doc_info in self.doc_lookup.items():
+            text = doc_info["text"].lower()
+            term_matches = sum(1 for term in query_terms if term in text)
+            
+            if term_matches > 0:
+                score = term_matches * 10
+                # Extra points for exact phrase match
+                if query_text.lower() in text:
+                    score += 20
+                    
+                results.append({
+                    "source": doc_info["source"],
+                    "name": doc_info["streamer"],
+                    "doc": doc_info["text"][:150] + "..." if len(doc_info["text"]) > 150 else doc_info["text"],
+                    "sim_score": score,
+                    "semantic_score": score
+                })
+        
+        # Sort by score
+        results.sort(key=lambda x: x["sim_score"], reverse=True)
+        return results[:top_k]
 
-def make_snippet(text, terms, max_len=300):
-    sentences = re.split(r'(?<=[.!?])\s+', text.replace("\n", " "))
-    for sent in sentences:
-        for t in terms:
-            if t.lower() in sent.lower():
-                sent = sent.strip()
-                return sent if len(sent) <= max_len else sent[:max_len].rstrip() + "…"
-    return text[:max_len].rstrip() + ("…" if len(text) > max_len else "")
-
-def get_twitch_info(name):
-    sun = name.upper().strip()
-    if sun in streamer_csv_data:
-        data = streamer_csv_data[sun].copy()
-        if not data.get("url") and (tu := data.get("Twitch URL", "")):
-            data["url"] = tu.strip()
-        else: data["url"] = f"https://www.twitch.tv/{name.replace(' ', '').lower()}"
-        if "Name" not in data: data["Name"] = name
-        return data
-    return {"url": f"https://www.twitch.tv/{name.replace(' ', '').lower()}", "Name": name}
-
-def get_image_path(name):
-    for v in [name.upper(), name, name.lower(), name.replace(" ", ""), name.replace(" ", "_")]:
-        for e in [".jpg", ".png", ".jpeg", ".webp"]:
-            if os.path.exists(path := os.path.join(BACK, "static/images/streamer_images", f"{v}{e}")):
-                return f"images/streamer_images/{v}{e}"
-    return "images/streamer_images/default.png"
-
-# BOOLEAN SEARCH
+# ===== Boolean Search =====
 def create_boolean_index():
+    """Create an inverted index for boolean search"""
     index = defaultdict(list)
-    # Reddit
+    
+    # Index Reddit data
     for streamer, posts in reddit_data.items():
-        if not is_valid_username(streamer) or not isinstance(posts, list): continue
-        for i, post in enumerate(posts):
-            if not isinstance(post, dict): continue
-            for w in [w for w in re.findall(r"\w+", post.get("Title", "").lower()) if w not in STOP_WORDS]:
-                index[w].append(("reddit", streamer, i))
+        if isinstance(posts, list):
+            for i, post in enumerate(posts):
+                if isinstance(post, dict) and "Title" in post:
+                    words = re.findall(r"\w+", post["Title"].lower())
+                    for w in words: 
+                        index[w].append(("reddit", streamer, i))
     
-    # Twitter
+    # Index Twitter data
     for streamer, tweets in twitter_data.items():
-        if not is_valid_username(streamer) or not isinstance(tweets, list): continue
-        for i, tweet in enumerate(tweets):
-            for w in [w for w in re.findall(r"\w+", str(tweet).lower()) if w not in STOP_WORDS]:
-                index[w].append(("twitter", streamer, i))
+        if isinstance(tweets, list):
+            for i, tweet in enumerate(tweets):
+                words = re.findall(r"\w+", str(tweet).lower())
+                for w in words: 
+                    index[w].append(("twitter", streamer, i))
     
-    # Wiki
-    if isinstance(wiki_data, dict):
-        for streamer, entry in wiki_data.items():
-            if not is_valid_username(streamer) or not isinstance(entry, dict): continue
-            for i, chunk in enumerate(split_text(entry.get("content", ""))):
-                for w in [w for w in re.findall(r"\w+", chunk.lower()) if w not in STOP_WORDS]:
-                    index[w].append(("wiki", streamer, i))
-    
-    # Details
+    # Index details data
     for streamer, details in details_data.items():
-        if not is_valid_username(streamer) or not isinstance(details, dict): continue
-        for w in [w for w in re.findall(r"\w+", str(details.get("Description", "")).lower()) if w not in STOP_WORDS]:
-            index[w].append(("details", streamer, 0))
+        if isinstance(details, dict):
+            description = str(details.get("Description", ""))
+            words = re.findall(r"\w+", description.lower())
+            for w in words: 
+                index[w].append(("details", streamer, 0))
     
     return index
 
-def boolean_search(query, index):
-    terms = [t for t in re.findall(r"\w+", query.lower()) if t not in STOP_WORDS]
-    if not terms: return []
+def boolean_search(query, index, top_k=TOP_K):
+    """Perform boolean search using the inverted index"""
+    if index is None:
+        logger.error("Boolean index is None, cannot perform search")
+        return []
+        
+    terms = re.findall(r"\w+", query.strip().lower())
+    if not terms: 
+        return []
     
-    matches, info = defaultdict(int), {}
+    doc_matches = defaultdict(int)
+    doc_info = {}
+    
     for term in terms:
-        if term not in index: continue
-        for source, streamer, idx in index[term]:
-            doc_id = f"{source}:{streamer}:{idx}"
-            matches[doc_id] += 1
-            
-            if doc_id in info: continue
-            
-            # Extract document text based on source
-            text, score = "", 1
-            try:
-                if source == "reddit" and streamer in reddit_data and isinstance(reddit_data[streamer], list):
-                    if idx < len(reddit_data[streamer]) and isinstance(post := reddit_data[streamer][idx], dict):
-                        text, score = post.get("Title", ""), post.get("Score", 1)
-                        info[doc_id] = {"source": source, "streamer": streamer, "data": post, 
-                                       "text": text, "score": score, "idx": idx, "term_matches": 0}
+        if term in index:
+            for doc_ref in index[term]:
+                source, streamer, idx = doc_ref
+                doc_id = f"{source}:{streamer}:{idx}"
+                doc_matches[doc_id] += 1
                 
-                elif source == "twitter" and streamer in twitter_data and isinstance(twitter_data[streamer], list):
-                    if idx < len(twitter_data[streamer]):
-                        text = str(twitter_data[streamer][idx])
-                        info[doc_id] = {"source": source, "streamer": streamer, "data": twitter_data[streamer][idx],
-                                       "text": text, "score": 1, "idx": idx, "term_matches": 0}
-                
-                elif source == "wiki" and streamer in wiki_data and isinstance(wiki_data[streamer], dict):
-                    chunks = split_text(wiki_data[streamer].get("content", ""))
-                    if idx < len(chunks):
-                        text = chunks[idx]
-                        info[doc_id] = {"source": source, "streamer": streamer, "data": wiki_data[streamer],
-                                       "text": text, "score": 2, "idx": idx, "term_matches": 0}
-                
-                elif source == "details" and streamer in details_data and isinstance(details_data[streamer], dict):
-                    text = str(details_data[streamer].get("Description", ""))
-                    info[doc_id] = {"source": source, "streamer": streamer, "data": details_data[streamer],
-                                   "text": text, "score": 3, "idx": idx, "term_matches": 0}
-            except: continue
+                if doc_id not in doc_info:
+                    try:
+                        if source == "reddit" and streamer in reddit_data and len(reddit_data[streamer]) > idx:
+                            post = reddit_data[streamer][idx]
+                            text = post.get("Title", "")
+                            score = post.get("Score", 1)
+                            doc_info[doc_id] = {
+                                "source": source,
+                                "name": streamer,
+                                "doc": text,
+                                "score": score,
+                                "term_matches": 0
+                            }
+                        elif source == "twitter" and streamer in twitter_data and len(twitter_data[streamer]) > idx:
+                            text = str(twitter_data[streamer][idx])
+                            doc_info[doc_id] = {
+                                "source": source,
+                                "name": streamer,
+                                "doc": text,
+                                "score": 1,
+                                "term_matches": 0
+                            }
+                        elif source == "details" and streamer in details_data:
+                            text = str(details_data[streamer].get("Description", ""))
+                            doc_info[doc_id] = {
+                                "source": source,
+                                "name": streamer,
+                                "doc": text,
+                                "score": 1,
+                                "term_matches": 0
+                            }
+                    except Exception as e:
+                        logger.error(f"Error processing document {doc_id}: {e}")
+                        continue
     
-    for doc_id, count in matches.items():
-        if doc_id in info: info[doc_id]["term_matches"] = count
+    # Update term match counts
+    for doc_id, count in doc_matches.items():
+        if doc_id in doc_info:
+            doc_info[doc_id]["term_matches"] = count
     
-    return list(info.values())
+    # Score and sort results
+    results = []
+    for doc_id, info in doc_info.items():
+        # Calculate a relevance score
+        relevance = info["term_matches"] * 10
+        if info["source"] == "reddit":
+            relevance += min(info["score"] / 100, 10)
+        
+        # Add exact match bonus
+        if any(term in info["doc"].lower() for term in terms):
+            relevance += 5
+        
+        # Add source type bonus
+        if info["source"] == "twitter":
+            relevance += 2
+        elif info["source"] == "details":
+            relevance += 3
+        
+        info["boolean_score"] = round(relevance, 2)
+        results.append(info)
+    
+    # Sort by relevance score
+    results.sort(key=lambda x: x["boolean_score"], reverse=True)
+    return results[:top_k]
 
-def score_boolean_results(results, query):
-    terms = re.findall(r"\w+", query.lower())
-    scored = []
-    
-    for doc in results:
-        if not isinstance(doc, dict): continue
-        
-        text = doc.get("text", "")
-        score = doc.get("term_matches", 0) * 15
-        score += sum(text.lower().count(term) * 5 for term in terms)
-        
-        ss = doc.get("score", 1)
-        if doc["source"] == "reddit" and isinstance(ss, (int, float)):
-            score += min(ss / 500.0, 20) if ss > 0 else 0
-        elif doc["source"] == "wiki": score += 15
-        elif doc["source"] == "details": score += 10
-        
-        if query.lower() in text.lower(): score += 50
-        
-        snippet = make_snippet(text, terms)
-        fmt = {
-            "source": doc["source"],
-            "name": doc["streamer"],
-            "snippet": snippet,
-            "idx": doc["idx"],
-            "doc": snippet,
-            "boolean_score": round(score, 2),
-            "term_matches": doc.get("term_matches", 0)
-        }
-        
-        if doc["source"] == "reddit" and isinstance(doc.get("data"), dict):
-            fmt["reddit_score"] = ss
-            fmt["id"] = doc["data"].get("ID", "")
-        
-        scored.append((fmt, score))
-    
-    return [d for d, s in sorted(scored, key=lambda x: x[1], reverse=True)]
-
-# SEMANTIC SEARCH
-def gather_documents():
-    docs = []
-    
-    # Process data with identity prefixes and chunking
-    for streamer, posts in reddit_data.items():
-        if not is_valid_username(streamer) or not isinstance(posts, list): continue
-        for idx, post in enumerate(posts):
-            if not isinstance(post, dict) or "Title" not in post: continue
-            docs.append({"text": f"{streamer}: {post['Title']}", "source": "reddit", 
-                        "streamer": streamer, "idx": idx, "data": post, "score": post.get("Score", 1)})
-    
-    for streamer, tweets in twitter_data.items():
-        if not is_valid_username(streamer) or not isinstance(tweets, list): continue
-        for idx, tweet in enumerate(tweets):
-            if not isinstance(tweet, str): continue
-            docs.append({"text": f"{streamer}: {tweet}", "source": "twitter", 
-                        "streamer": streamer, "idx": idx, "data": tweet, "score": 1})
-    
-    for streamer, entry in wiki_data.items():
-        if not is_valid_username(streamer) or not isinstance(entry, dict): continue
-        for idx, chunk in enumerate(split_text(entry.get("content", ""))):
-            docs.append({"text": f"{streamer}: {chunk}", "source": "wiki", 
-                        "streamer": streamer, "idx": idx, "data": entry, "score": 2})
-    
-    for streamer, details in details_data.items():
-        if not is_valid_username(streamer) or not isinstance(details, dict): continue
-        if desc := str(details.get("Description", "")):
-            docs.append({"text": f"{streamer}: {desc}", "source": "details", 
-                        "streamer": streamer, "idx": 0, "data": details, "score": 3})
-    
-    return docs
-
-def score_semantic_results(results, query):
-    terms = set(re.findall(r"\w+", query.lower()))
-    scored = []
-    
-    for doc in results:
-        if not isinstance(doc, dict): continue
-        
-        score = doc.get("sim_score", 0.0)
-        text = doc.get("text", "").lower()
-        
-        # Boost scores based on source
-        if doc["source"] == "wiki": score += 15
-        elif doc["source"] == "details": score += 10
-        elif doc["source"] == "reddit" and isinstance(ss := doc.get("score", 1), (int, float)):
-            score += min(ss / 500.0, 20) if ss > 0 else 0
-        
-        # Term frequency bonus
-        score += sum(text.count(term) * 2 for term in terms if term)
-        
-        # Exact phrase bonus
-        if query and query.lower() in text: score += 30
-        
-        fmt = {
-            "source": doc.get("source", "unknown"),
-            "name": doc.get("streamer", "unknown"),
-            "doc": text[:150] + ("..." if len(text) > 150 else ""),
-            "semantic_score": round(score, 2),
-            "sim_score": doc.get("sim_score", 0.0),
-            "idx": doc.get("idx", 0)
-        }
-        
-        if doc["source"] == "reddit" and isinstance(doc.get("data"), dict):
-            fmt["reddit_score"] = doc.get("score", 1)
-            fmt["id"] = doc["data"].get("ID", "")
-        
-        scored.append((fmt, score))
-    
-    return [d for d, s in sorted(scored, key=lambda x: x[1], reverse=True)]
-
-# HYBRID SEARCH
-def combine_results(bool_res, sem_res, threshold=5.0):
-    combined = {}
-    
-    # Helper to create doc key
-    def get_key(doc):
-        if not isinstance(doc, dict): return None
-        source = doc.get('source', 'unk')
-        streamer = doc.get('name', 'unk')
-        idx = doc.get('idx', -1)
-        doc_id = doc.get('id', None)
-        return (f"{source}:{streamer}:{doc_id}" if source == 'reddit' and doc_id else
-                f"{source}:{streamer}:{idx}" if idx != -1 else
-                f"{source}:{streamer}:{doc.get('doc', '')[:20]}")
-    
-    # Process boolean results
-    for doc in bool_res:
-        if key := get_key(doc):
-            combined[key] = {"doc_info": doc.copy(), "boolean_score": doc.get("boolean_score", 0.0),
-                           "semantic_score": 0.0, "sim_score": 0.0}
+# ===== Hybrid Search =====
+def combine_search_results(semantic_results, boolean_results, semantic_weight=WIKI_SEMANTIC_WEIGHT, boolean_weight=BOOLEAN_WEIGHT):
+    """Combine semantic and boolean search results with weighting"""
+    combined_results = {}
     
     # Process semantic results
-    for doc in sem_res:
-        if key := get_key(doc):
-            if key not in combined:
-                combined[key] = {"doc_info": doc.copy(), "boolean_score": 0.0,
-                               "semantic_score": doc.get("semantic_score", 0.0),
-                               "sim_score": doc.get("sim_score", 0.0)}
-            else:
-                combined[key]["semantic_score"] = max(combined[key]["semantic_score"], 
-                                                    doc.get("semantic_score", 0.0))
-                combined[key]["sim_score"] = max(combined[key]["sim_score"], doc.get("sim_score", 0.0))
-                combined[key]["doc_info"] = doc.copy()  # Use semantic version for better info
+    for result in semantic_results:
+        streamer = result["name"]
+        if streamer not in combined_results:
+            combined_results[streamer] = {
+                "name": streamer,
+                "documents": [],
+                "max_score": 0
+            }
+        # Normalize and weight the semantic score
+        weighted_score = result["semantic_score"] * semantic_weight
+        result["final_score"] = round(weighted_score, 2)
+        combined_results[streamer]["documents"].append(result)
+        combined_results[streamer]["max_score"] = max(combined_results[streamer]["max_score"], weighted_score)
     
-    # Calculate final scores
-    scored_docs = []
-    for data in combined.values():
-        b_score, s_score = data["boolean_score"], data["semantic_score"]
-        
-        # Calculate final score based on presence and thresholds
-        if b_score > 0 and s_score > 0:
-            # Both scores present - use weighted sum
-            final_score = (b_score * BOOLEAN_WEIGHT) + (s_score * SEMANTIC_WEIGHT)
-        elif b_score > threshold:
-            # Only boolean above threshold
-            final_score = b_score
-        elif s_score > threshold:
-            # Only semantic above threshold
-            final_score = s_score
-        else:
-            # Neither meets criteria
-            continue
-        
-        # Add final score to doc and collect
-        doc = data["doc_info"]
-        doc["final_score"] = round(final_score, 2)
-        doc["sim_score"] = round(data.get("sim_score", 0.0), 2)
-        scored_docs.append(doc)
-    
-    # Group by streamer
-    streamer_results = defaultdict(lambda: {"name": "", "documents": [], "max_final_score": 0.0})
-    for doc in scored_docs:
-        name = doc.get("name", "unknown")
-        if name != "unknown":
-            streamer_results[name]["name"] = name
-            streamer_results[name]["documents"].append(doc)
-            streamer_results[name]["max_final_score"] = max(
-                streamer_results[name]["max_final_score"],
-                doc.get("final_score", 0.0)
-            )
+    # Process boolean results
+    for result in boolean_results:
+        streamer = result["name"]
+        if streamer not in combined_results:
+            combined_results[streamer] = {
+                "name": streamer,
+                "documents": [],
+                "max_score": 0
+            }
+        # Normalize and weight the boolean score
+        weighted_score = result["boolean_score"] * boolean_weight
+        result["final_score"] = round(weighted_score, 2)
+        combined_results[streamer]["documents"].append(result)
+        combined_results[streamer]["max_score"] = max(combined_results[streamer]["max_score"], weighted_score)
     
     # Sort streamers by max score
-    results = list(streamer_results.values())
-    results.sort(key=lambda x: x["max_final_score"], reverse=True)
+    sorted_results = sorted(combined_results.values(), key=lambda x: x["max_score"], reverse=True)
     
-    # Sort documents within each streamer
-    for sd in results:
-        sd["documents"].sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
+    # Sort documents within each streamer by score
+    for streamer_data in sorted_results:
+        streamer_data["documents"].sort(key=lambda x: x["final_score"], reverse=True)
+        # Limit to top 5 documents per streamer
+        streamer_data["documents"] = streamer_data["documents"][:5]
     
-    return results
+    return sorted_results
 
-# INITIALIZE SEARCH SYSTEM
-print("Initializing search system...")
+# ===== Helper Functions =====
+def get_twitch_info(streamer_name):
+    """Get Twitch page info for a streamer if available."""
+    variants = [
+        streamer_name,
+        streamer_name.upper(),
+        streamer_name.lower(),
+        streamer_name.title(),
+        streamer_name.replace(" ", "")
+    ]
+    for name_variant in variants:
+        if name_variant in streamer_csv_data:
+            data = streamer_csv_data[name_variant]
+            if "Twitch URL" in data and data["Twitch URL"].strip():
+                return data
+            else:
+                default_url = f"https://www.twitch.tv/{streamer_name}"
+                data["url"] = default_url
+                return data
+    logger.info(f"No Twitch data found for streamer: {streamer_name}")
+    return None
 
-# Load or build boolean index
+def get_streamer_image_path(streamer_name):
+    """Get the image path for a streamer if available."""
+    image_paths = [
+        f"images/streamer_images/{streamer_name.upper()}.jpg",
+        f"images/streamer_images/{streamer_name}.jpg",
+        f"images/streamer_images/{streamer_name.lower()}.jpg",
+        f"images/streamer_images/{streamer_name.replace(' ', '')}.jpg"
+    ]
+    return image_paths[0]
+
+def get_csv_streamer_info(streamer_name):
+    """Look up extra CSV info for the streamer from streamer_details.csv."""
+    name_upper = streamer_name.upper().strip()
+    return streamer_csv_data.get(name_upper, None)
+
+# ===== Initialize Search System =====
+logger.info("Initializing search system...")
+
+# Initialize Word2Vec search for Wikipedia
+wiki_search = LightWord2VecSearch(model_name=MODEL_NAME, vector_size=VECTOR_SIZE)
+
+# Check if model needs to be rebuilt based on configuration
+if not wiki_search.rebuild_model_if_needed():
+    logger.warning("Failed to load or rebuild Word2Vec model. Using fallback only...")
+
+# Load the word2vec model for queries (needed even if vectors are pre-computed)
+wiki_search.load_pretrained_model()
+
+# Initialize boolean search index
+boolean_index = None
 try:
     if os.path.exists(BOOLEAN_INDEX_PATH):
+        logger.info("Loading boolean index...")
         with open(BOOLEAN_INDEX_PATH, "rb") as f:
             boolean_index = pickle.load(f)
     else:
-        print("Building boolean index...")
+        logger.info("Building boolean index...")
         boolean_index = create_boolean_index()
+        os.makedirs(os.path.dirname(BOOLEAN_INDEX_PATH), exist_ok=True)
         with open(BOOLEAN_INDEX_PATH, "wb") as f:
             pickle.dump(boolean_index, f)
 except Exception as e:
-    print(f"Error with boolean index: {e}")
+    logger.error(f"Error with boolean index: {e}")
     boolean_index = create_boolean_index()
 
-# Initialize model
-device = "cpu"
-model = SentenceTransformer(MODEL_NAME, device=device)
-
-# Load or build embeddings
-# Load or build embeddings
-DOCS, EMBEDDINGS = [], None
-if os.path.exists(EMBED_PATH) or os.path.exists(META_PATH):
-    try:
-        print(f"Attempting to load embeddings from {EMBED_PATH}")
-        EMBEDDINGS = np.load(EMBED_PATH)
-        print(f"Successfully loaded embeddings with shape: {EMBEDDINGS.shape}")
-        
-        print(f"Attempting to load metadata from {META_PATH}")
-        with open(META_PATH, "rb") as f:
-            DOCS = pickle.load(f)
-        print(f"Successfully loaded metadata with {len(DOCS)} documents")
-        
-        if EMBEDDINGS.shape[1] != EMBED_DIM or len(DOCS) != EMBEDDINGS.shape[0]:
-            raise ValueError(f"Dimension mismatch: EMBEDDINGS shape: {EMBEDDINGS.shape}, DOCS length: {len(DOCS)}, Expected EMBED_DIM: {EMBED_DIM}")
-    except Exception as e:
-        print(f"ERROR LOADING FILES: {e}")
-        EMBEDDINGS, DOCS = None, []
-
-# Build embeddings if needed
-if EMBEDDINGS is None:
-    print("Building new embeddings...")
-    # 1) gather all raw texts per streamer
-    per_stream = defaultdict(list)
-    # collect from every source
-    for d in gather_documents():
-        per_stream[d["streamer"]].append(d["text"])
-
-    DOCS, vectors = [], []
-    total_streamers = len(per_stream)
-    
-    # Add progress bar
-    with tqdm(total=total_streamers, desc="Embedding streamers") as pbar:
-        for streamer, texts in per_stream.items():
-            full_text = " ".join(texts)
-            vec = embed_streamer(full_text, chunk_size=200)
-            DOCS.append({"streamer": streamer})
-            vectors.append(vec)
-            pbar.update(1)
-            
-    # 2) stack into (N,768) array
-    EMBEDDINGS = np.vstack(vectors).astype(np.float32)
-    print(f"\nBuilt {len(DOCS)} streamer-level embeddings via chunk+pool")
-
-    # 3) save
-    np.save(EMBED_PATH, EMBEDDINGS)
-    with open(META_PATH, "wb") as f:
-        pickle.dump(DOCS, f)
-
-    print(f"Saved embeddings to {EMBED_PATH} and metadata to {META_PATH}")
-
-# Initialize FAISS index with IP for cosine similarity
-try:
-    EMBEDDINGS = np.ascontiguousarray(EMBEDDINGS) if not EMBEDDINGS.flags['C_CONTIGUOUS'] else EMBEDDINGS
-    index = faiss.IndexFlatIP(EMBED_DIM)  # Using IP for normalized embeddings = cosine similarity
-    index.add(EMBEDDINGS)
-    del EMBEDDINGS; gc.collect()  # Release memory
-except Exception as e:
-    print(f"Error initializing FAISS: {e}"); sys.exit(1)
-
-# FLASK SERVER
-app = Flask(__name__, static_folder='static')
+# ===== Initialize Flask App =====
+app = Flask(__name__)
 CORS(app)
 
 @app.route("/")
@@ -523,72 +704,95 @@ def home():
 
 @app.route("/search")
 def search_streamer():
-    query = request.args.get("name", "").strip()
-    if not query: return jsonify([])
+    query = request.args.get("name", "")
+    if not query:
+        return jsonify([])
     
-    # Boolean search
-    bool_res = score_boolean_results(boolean_search(query, boolean_index), query)
+    logger.info(f"Search query: {query}")
+    start_time = time.time()
     
-    # Semantic search
-    sem_raw = []
     try:
-        q_emb = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
+        # Perform Word2Vec search on Wikipedia data
+        semantic_results = wiki_search.query(query)
+        logger.info(f"Semantic search: {len(semantic_results)} results in {time.time() - start_time:.4f} seconds")
         
-        # Get semantically similar documents (higher score = better match with IndexFlatIP)
-        scores, ids = index.search(q_emb, TOP_K)
+        # Perform boolean search on other data
+        boolean_results = boolean_search(query, boolean_index)
+        logger.info(f"Boolean search: {len(boolean_results)} results in {time.time() - start_time:.4f} seconds")
         
-        for score, idx in zip(scores[0], ids[0]):
-            if idx == -1 or idx >= len(DOCS): continue
-            
-            meta = DOCS[idx]
-            if not isinstance(meta, dict): continue
-            
-            # Normalize cosine similarity to 0-100 range
-            sim_score = max(0.0, min(1.0, score)) * 100
-            
-            sem_raw.append({
-                "source": meta.get("source", "unknown"),
-                "streamer": meta.get("streamer", "unknown"),
-                "text": meta.get("text", ""),
-                "idx": meta.get("idx", idx),
-                "score": meta.get("score", 1),
-                "data": meta.get("data", {}),
-                "sim_score": round(sim_score, 2)
+        # Combine results
+        combined_results = combine_search_results(semantic_results, boolean_results)
+        logger.info(f"Combined search: {len(combined_results)} streamers found")
+        
+        # Format final results
+        final_results = []
+        for streamer_data in combined_results[:10]:  # Limit to top 10 streamers
+            streamer_name = streamer_data["name"]
+            final_results.append({
+                "name": streamer_name,
+                "documents": streamer_data["documents"],
+                "twitch_info": get_twitch_info(streamer_name),
+                "image_path": get_streamer_image_path(streamer_name),
+                "csv_data": get_csv_streamer_info(streamer_name)
             })
-    except Exception as e:
-        print(f"Error in semantic search: {e}")
-    
-    sem_res = score_semantic_results(sem_raw, query)
-    
-    # Combine results
-    comb_res = combine_results(bool_res, sem_res)
-    
-    # Format final output
-    final_res = []
-    for sd in comb_res[:10]:  # Limit to top 10 streamers
-        name = sd.get("name", "Unknown")
-        docs = sd.get("documents", [])[:4]  # Limit to top 4 docs per streamer
         
-        final_res.append({
-            "name": name,
-            "documents": docs,
-            "twitch_info": get_twitch_info(name),
-            "image_path": get_image_path(name),
-            "csv_data": streamer_csv_data.get(name.upper().strip(), {}),
-            "max_combined_score": sd.get("max_final_score", 0.0)
-        })
-    def sanitize(o):
-        if isinstance(o, np.generic):
-            return o.item()
-        if isinstance(o, np.ndarray):
-            return o.tolist()
-        raise TypeError(f"Unserializable object {type(o)}")
+        logger.info(f"Search completed in {time.time() - start_time:.4f} seconds")
+        return jsonify(final_results)
+    except Exception as e:
+        logger.error(f"Error during search: {e}", exc_info=True)
+        return jsonify([])  # Return empty results rather than error
 
-    clean = json.loads(json.dumps(final_res, default=sanitize))
-    return jsonify(clean)
+# Additional endpoint for Wikipedia-only search
+@app.route("/wiki-search")
+def wiki_search_endpoint():
+    query = request.args.get("name", "")
+    if not query:
+        return jsonify([])
     
-
+    logger.info(f"Wiki search query: {query}")
+    start_time = time.time()
+    
+    try:
+        # Perform Word2Vec search on Wikipedia data
+        semantic_results = wiki_search.query(query)
+        logger.info(f"Wiki search: {len(semantic_results)} results in {time.time() - start_time:.4f} seconds")
+        # Group by streamer
+        streamer_results = {}
+        for result in semantic_results:
+            streamer = result["name"]
+            if streamer not in streamer_results:
+                streamer_results[streamer] = {
+                    "name": streamer,
+                    "documents": [],
+                    "max_score": 0
+                }
+            result["final_score"] = result["semantic_score"]  # Use semantic score as final score
+            streamer_results[streamer]["documents"].append(result)
+            streamer_results[streamer]["max_score"] = max(
+                streamer_results[streamer]["max_score"], 
+                result["semantic_score"]
+            )
+        
+        # Sort streamers by max score
+        sorted_results = sorted(streamer_results.values(), key=lambda x: x["max_score"], reverse=True)
+        
+        # Format final results
+        final_results = []
+        for streamer_data in sorted_results[:10]:  # Limit to top 10 streamers
+            streamer_name = streamer_data["name"]
+            final_results.append({
+                "name": streamer_name,
+                "documents": streamer_data["documents"][:5],  # Limit to top 5 documents per streamer
+                "twitch_info": get_twitch_info(streamer_name),
+                "image_path": get_streamer_image_path(streamer_name),
+                "csv_data": get_csv_streamer_info(streamer_name)
+            })
+        
+        logger.info(f"Wiki search completed in {time.time() - start_time:.4f} seconds")
+        return jsonify(final_results)
+    except Exception as e:
+        logger.error(f"Error during wiki search: {e}", exc_info=True)
+        return jsonify([])  # Return empty results rather than error
 
 if __name__ == "__main__":
-
-    app.run(debug=False, host="0.0.0.0", port=5001)
+    app.run(debug=True, host="0.0.0.0", port=5001)

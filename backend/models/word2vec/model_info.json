@@ -1,0 +1,1 @@
+{"model_name": "glove-wiki-gigaword-300", "vector_size": 300, "doc_count": 861, "created_at": "2025-04-22 23:30:37", "vectors_path": "/Users/ehfurgeson/Documents/GitHub/stream-finder/backend/models/word2vec/wiki_doc_vectors_300.npy", "lookup_path": "/Users/ehfurgeson/Documents/GitHub/stream-finder/backend/models/word2vec/wiki_doc_lookup_300.pkl"}
