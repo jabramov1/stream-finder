@@ -25,7 +25,7 @@ STOP_WORDS = {"the", "and", "a", "of", "to", "in", "is", "you", "that", "it", "w
 # LOAD DATA
 BACK = os.path.dirname(os.path.abspath(__file__))
 try:
-    with open(os.path.join(BACK, "init2.json"), "r", encoding="utf-8") as f:
+    with open(os.path.join(BACK, "init.json"), "r", encoding="utf-8") as f:
         init = json.load(f)
         reddit_data, twitter_data = init.get("reddit", {}), init.get("twitter", {})
         wiki_data, details_data = init.get("wiki", {}), init.get("details", {})
