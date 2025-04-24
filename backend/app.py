@@ -8,6 +8,20 @@ from collections import defaultdict
 import gc
 from tqdm import tqdm
 
+print("👋  app.py launched", flush=True)
+
+app_dir = os.path.abspath(os.path.dirname(__file__))
+print("App directory:", app_dir, flush=True)
+
+print("Contents:", os.listdir(app_dir), flush=True)
+
+for root, _, files in os.walk(app_dir):
+    for f in files:
+        print(os.path.join(root, f), flush=True)
+
+print("sys.path =", sys.path, flush=True)
+print("ENV PATH =", os.environ.get("PATH", ""), flush=True)
+
 
 
 # CONFIG
@@ -25,7 +39,7 @@ STOP_WORDS = {"the", "and", "a", "of", "to", "in", "is", "you", "that", "it", "w
 # LOAD DATA
 BACK = os.path.dirname(os.path.abspath(__file__))
 try:
-    with open(os.path.join(BACK, "init2.json"), "r", encoding="utf-8") as f:
+    with open(os.path.join(BACK, "init.json"), "r", encoding="utf-8") as f:
         init = json.load(f)
         reddit_data, twitter_data = init.get("reddit", {}), init.get("twitter", {})
         wiki_data, details_data = init.get("wiki", {}), init.get("details", {})
@@ -34,6 +48,9 @@ except Exception as e:
 
 # Load CSV data if available
 streamer_csv_data = {}
+print(f"Looking for embeddings at: {os.path.join(BACK, EMBED_PATH)}")
+print(f"Looking for metadata at: {os.path.join(BACK, META_PATH)}")
+print(f"Directory exists: {os.path.exists(BACK)}")
 if os.path.exists(CSV_PATH := os.path.join(BACK, "streamer_details.csv")):
     try:
         streamer_csv = pd.read_csv(CSV_PATH).fillna("")
@@ -561,4 +578,5 @@ def search_streamer():
 
 
 if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=5001)
+
+    app.run(debug=False, host="0.0.0.0", port=5000)
