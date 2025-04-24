@@ -8,6 +8,7 @@ from collections import defaultdict
 import gc
 from tqdm import tqdm
 
+
 print("👋 app.py launched", flush=True)
 app_dir = os.path.abspath(os.path.dirname(__file__))
 print("App directory:", app_dir, flush=True)
@@ -452,15 +453,23 @@ device = "cpu"
 model = SentenceTransformer(MODEL_NAME, device=device)
 
 # Load or build embeddings
+# Load or build embeddings
 DOCS, EMBEDDINGS = [], None
-if os.path.exists(EMBED_PATH) and os.path.exists(META_PATH):
+if os.path.exists(EMBED_PATH) or os.path.exists(META_PATH):
     try:
+        print(f"Attempting to load embeddings from {EMBED_PATH}")
         EMBEDDINGS = np.load(EMBED_PATH)
+        print(f"Successfully loaded embeddings with shape: {EMBEDDINGS.shape}")
+        
+        print(f"Attempting to load metadata from {META_PATH}")
         with open(META_PATH, "rb") as f:
             DOCS = pickle.load(f)
+        print(f"Successfully loaded metadata with {len(DOCS)} documents")
+        
         if EMBEDDINGS.shape[1] != EMBED_DIM or len(DOCS) != EMBEDDINGS.shape[0]:
-            raise ValueError("Dimension mismatch")
-    except:
+            raise ValueError(f"Dimension mismatch: EMBEDDINGS shape: {EMBEDDINGS.shape}, DOCS length: {len(DOCS)}, Expected EMBED_DIM: {EMBED_DIM}")
+    except Exception as e:
+        print(f"ERROR LOADING FILES: {e}")
         EMBEDDINGS, DOCS = None, []
 
 # Build embeddings if needed
