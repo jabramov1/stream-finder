@@ -34,6 +34,9 @@ except Exception as e:
 
 # Load CSV data if available
 streamer_csv_data = {}
+print(f"Looking for embeddings at: {os.path.join(BACK, EMBED_PATH)}")
+print(f"Looking for metadata at: {os.path.join(BACK, META_PATH)}")
+print(f"Directory exists: {os.path.exists(BACK)}")
 if os.path.exists(CSV_PATH := os.path.join(BACK, "streamer_details.csv")):
     try:
         streamer_csv = pd.read_csv(CSV_PATH).fillna("")
