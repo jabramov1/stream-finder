@@ -8,16 +8,19 @@ from collections import defaultdict
 import gc
 from tqdm import tqdm
 
-print("👋  app.py launched", flush=True)
-
+print("👋 app.py launched", flush=True)
 app_dir = os.path.abspath(os.path.dirname(__file__))
 print("App directory:", app_dir, flush=True)
 
-print("Contents:", os.listdir(app_dir), flush=True)
+# Filter out static folder when listing contents
+contents = [item for item in os.listdir(app_dir) if item != "static"]
+print("Contents:", contents, flush=True)
 
+# Skip the static folder when walking through directories
 for root, _, files in os.walk(app_dir):
-    for f in files:
-        print(os.path.join(root, f), flush=True)
+    if "static" not in root:
+        for f in files:
+            print(os.path.join(root, f), flush=True)
 
 print("sys.path =", sys.path, flush=True)
 print("ENV PATH =", os.environ.get("PATH", ""), flush=True)
@@ -27,9 +30,9 @@ print("ENV PATH =", os.environ.get("PATH", ""), flush=True)
 # CONFIG
 MODEL_NAME             = "intfloat/e5-base-v2"
 EMBED_DIM, TOP_K       = 768, 25
-META_PATH              = "metadata.pkl"
-BOOLEAN_INDEX_PATH     = "boolean_index.pkl"
-EMBED_PATH             = "embeddings.npy"
+META_PATH              = "models/metadata.pkl"
+BOOLEAN_INDEX_PATH     = "models/boolean_index.pkl"
+EMBED_PATH             = "models/embeddings.npy"
 SEMANTIC_WEIGHT        = 0.5
 BOOLEAN_WEIGHT         = 0.5
 TWITCH_USERNAME_REGEX = r'^[a-z0-9_]{4,25}'
@@ -44,7 +47,7 @@ try:
         reddit_data, twitter_data = init.get("reddit", {}), init.get("twitter", {})
         wiki_data, details_data = init.get("wiki", {}), init.get("details", {})
 except Exception as e:
-    print(f"Error loading init2.json: {e}. Exiting."); sys.exit(1)
+    print(f"Error loading init.json: {e}. Exiting."); sys.exit(1)
 
 # Load CSV data if available
 streamer_csv_data = {}
@@ -579,4 +582,4 @@ def search_streamer():
 
 if __name__ == "__main__":
 
-    app.run(debug=False, host="0.0.0.0", port=5000)
+    app.run(debug=False, host="0.0.0.0", port=5001)
