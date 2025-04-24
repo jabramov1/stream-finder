@@ -564,4 +564,20 @@ def search_streamer():
 
 
 if __name__ == "__main__":
+    print("App directory:", os.path.abspath(os.path.dirname(__file__)))
+
+    # 2) List the immediate files/sub-folders in that directory
+    print("Contents:", os.listdir(os.path.dirname(__file__)))
+
+    # 3) Recursively walk everything under it (prints full paths)
+    for root, dirs, files in os.walk(os.path.dirname(__file__)):
+        for f in files:
+            print(os.path.join(root, f))
+
+    # 4) Show Python’s module search paths
+    print("sys.path =", sys.path)
+
+    # 5) Show the shell’s PATH variable
+    print("ENV PATH =", os.environ.get("PATH", ""))
+
     app.run(debug=False, host="0.0.0.0", port=5001)
