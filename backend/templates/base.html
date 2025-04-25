@@ -110,15 +110,33 @@
         }
 
         function documentTemplate(doc) {
+            // pick an emoji based on the source
+            let icon = "";
+            switch (doc.source) {
+                case "twitter":
+                    icon = "🐦";
+                    break;
+                case "wiki":
+                    icon = "📰";
+                    break;
+                case "reddit":
+                    icon = "📱";
+                    break;
+                case "semantic BERT":
+                    icon = "🤖";
+                    break;
+            }
+
             return `
-                <div class="document-item">
-                    <p class="doc">${doc.doc}</p>
-                    <div class="meta-info">
-                        <span class="source">Source: ${doc.source}</span>
-                        <span class="sim-score">Score: ${doc.final_score}</span>
-                    </div>
-                </div>
-            `;
+        <div class="document-item">
+            <span class="icon">${icon}</span>
+            <p class="doc">${doc.doc}</p>
+            <div class="meta-info">
+                <span class="source">Source: ${doc.source}</span>
+                <span class="sim-score">Score: ${doc.final_score}</span>
+            </div>
+        </div>
+    `;
         }
 
         function sendFocus() {
@@ -520,6 +538,21 @@
 
         .slider.round:before {
             border-radius: 50%;
+        }
+
+        .document-item {
+            display: flex;
+            align-items: flex-start;
+        }
+
+        .document-item .icon {
+            margin-right: 8px;
+            font-size: 1.2em;
+            line-height: 1em;
+        }
+
+        .document-item .doc {
+            flex: 1;
         }
     </style>
 </body>

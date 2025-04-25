@@ -410,25 +410,30 @@ def combine_results(bool_res, sem_res, threshold=5.0):
         scored_docs.append(doc)
     
     # Group by streamer
-    streamer_results = defaultdict(lambda: {"name": "", "documents": [], "max_final_score": 0.0})
+    streamer_results = defaultdict(lambda: {"name": "", "documents": []})
     for doc in scored_docs:
         name = doc.get("name", "unknown")
-        if name != "unknown":
-            streamer_results[name]["name"] = name
-            streamer_results[name]["documents"].append(doc)
-            streamer_results[name]["max_final_score"] = max(
-                streamer_results[name]["max_final_score"],
-                doc.get("final_score", 0.0)
-            )
-    
-    # Sort streamers by max score
+        if name == "unknown":
+            continue
+        streamer_results[name]["name"] = name
+        streamer_results[name]["documents"].append(doc)
+
+    # ---- NEW: compute sum of top-3 final_scores per streamer ----
+    for data in streamer_results.values():
+        # collect all final_scores
+        scores = [d["final_score"] for d in data["documents"]]
+        # take top 3 (or fewer if <3 docs)
+        top3 = sorted(scores, reverse=True)[:3]
+        data["sum_top3_score"] = sum(top3)
+
+    # Convert to list and sort by our new metric
     results = list(streamer_results.values())
-    results.sort(key=lambda x: x["max_final_score"], reverse=True)
-    
-    # Sort documents within each streamer
+    results.sort(key=lambda x: x["sum_top3_score"], reverse=True)
+
+    # Also sort each streamer’s docs for display
     for sd in results:
         sd["documents"].sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
-    
+
     return results
 
 # INITIALIZE SEARCH SYSTEM
@@ -575,7 +580,7 @@ def search_streamer():
             "twitch_info": get_twitch_info(name),
             "image_path": get_image_path(name),
             "csv_data": streamer_csv_data.get(name.upper().strip(), {}),
-            "max_combined_score": sd.get("max_final_score", 0.0)
+            "sum_top3_score": sd.get("sum_top3_score", 0.0)
         })
     def sanitize(o):
         if isinstance(o, np.generic):
