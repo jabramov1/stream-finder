@@ -220,19 +220,16 @@ def boolean_search(query, postings, doc_info):
     if not terms:
         return []
 
-    # 2) sum up each doc's term frequencies
-    matches = defaultdict(int)
+    match_counts = Counter()
     for term in terms:
-        for doc_id, tf in postings.get(term, {}).items():
-            matches[doc_id] += tf
+        match_counts.update(postings.get(term, {}))
 
-    # 3) pull full metadata and inject term_matches
+    # Build results
     results = []
-    for doc_id, term_matches in matches.items():
+    for doc_id, term_matches in match_counts.items():
         info = doc_info[doc_id].copy()
         info["term_matches"] = term_matches
         results.append(info)
-
     return results
 
 def score_boolean_results(results, query):
@@ -572,7 +569,7 @@ def search_streamer():
             meta = DOCS[idx]
             sim_score = round(max(0.0, min(1.0, score)) * 100, 2)
             sem_raw.append({
-                "source":   meta.get("source", "unknown"),
+                "source":   meta.get("source", "semantic BERT"),
                 "streamer": meta.get("streamer", "unknown"),
                 "text":     meta.get("text", ""),
                 "idx":      meta.get("idx", idx),
