@@ -31,9 +31,9 @@ print("ENV PATH =", os.environ.get("PATH", ""), flush=True)
 # CONFIG
 MODEL_NAME             = "intfloat/e5-base-v2"
 EMBED_DIM, TOP_K       = 768, 25
-META_PATH              = "models/metadata.pkl"
+META_PATH              = "models/metadata2.pkl"
 BOOLEAN_INDEX_PATH     = "models/boolean_index.pkl"
-EMBED_PATH             = "models/embeddings.npy"
+EMBED_PATH             = "models/embeddings2.npy"
 SEMANTIC_WEIGHT        = 0.5
 BOOLEAN_WEIGHT         = 0.5
 TWITCH_USERNAME_REGEX = r'^[a-z0-9_]{4,25}'
