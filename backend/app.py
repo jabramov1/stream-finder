@@ -4,9 +4,9 @@ import faiss, torch
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import pandas as pd
-from collections import defaultdict
 import gc
 from tqdm import tqdm
+from collections import defaultdict, Counter
 
 
 df = pd.read_csv('top_1000_twitch.csv', dtype=str)
@@ -23,7 +23,7 @@ BOOLEAN_WEIGHT         = 0.5
 TWITCH_USERNAME_REGEX = r'^[a-z0-9_]{4,25}'
 
 STOP_WORDS = {"the", "and", "a", "of", "to", "in", "is", "you","who", "that", "it", "was", "for", "on", "streamer"}
-
+TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 # LOAD DATA
 BACK = os.path.dirname(os.path.abspath(__file__))
 try:
@@ -146,150 +146,141 @@ def get_image_path(name):
 
 # BOOLEAN SEARCH
 def create_boolean_index():
-    index = defaultdict(list)
-    # Match alphanumeric sequences, possibly joined by interior hyphens
-    token_pattern = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
+    postings = defaultdict(lambda: defaultdict(int))
+    doc_info = {}
 
-    # — Reddit posts —
-    for streamer, posts in reddit_data.items():
-        if not is_valid_username(streamer) or not isinstance(posts, list):
-            continue
-        for i, post in enumerate(posts):
-            title = post.get("Title", "")
-            for raw_tok in token_pattern.findall(title.lower()):
-                toks = {raw_tok}
-                if "-" in raw_tok:
-                    toks.update(raw_tok.split("-"))
-                for tok in toks:
-                    if tok not in STOP_WORDS:
-                        index[tok].append(("reddit", streamer, i))
-
-    # — Twitter tweets —
-    for streamer, tweets in twitter_data.items():
-        if not is_valid_username(streamer) or not isinstance(tweets, list):
-            continue
-        for i, tweet in enumerate(tweets):
-            text = str(tweet)
-            for raw_tok in token_pattern.findall(text.lower()):
-                toks = {raw_tok}
-                if "-" in raw_tok:
-                    toks.update(raw_tok.split("-"))
-                for tok in toks:
-                    if tok not in STOP_WORDS:
-                        index[tok].append(("twitter", streamer, i))
-
-    # — Wiki entries (one doc per streamer) —
-    if isinstance(wiki_data, dict):
-        for streamer, entry in wiki_data.items():
-            if not is_valid_username(streamer) or not isinstance(entry, dict):
-                continue
-            content = entry.get("content", "")
-            for raw_tok in token_pattern.findall(content.lower()):
-                toks = {raw_tok}
-                if "-" in raw_tok:
-                    toks.update(raw_tok.split("-"))
-                for tok in toks:
-                    if tok not in STOP_WORDS:
-                        index[tok].append(("wiki", streamer, 0))
-
-    # — Details descriptions —
-    for streamer, details in details_data.items():
-        if not is_valid_username(streamer) or not isinstance(details, dict):
-            continue
-        desc = str(details.get("Description", ""))
-        for raw_tok in token_pattern.findall(desc.lower()):
+    def add_doc(source, streamer, idx, text, score):
+        doc_id = f"{source}:{streamer}:{idx}"
+        # store metadata once
+        if doc_id not in doc_info:
+            doc_info[doc_id] = {
+                "source": source,
+                "streamer": streamer,
+                "text": text,
+                "score": score,
+                "idx": idx,
+                "term_matches": 0
+            }
+        # count tokens
+        for raw_tok in TOKEN_PATTERN.findall(text.lower()):
             toks = {raw_tok}
-            if "-" in raw_tok:
-                toks.update(raw_tok.split("-"))
+            if '-' in raw_tok:
+                toks |= set(raw_tok.split('-'))
             for tok in toks:
                 if tok not in STOP_WORDS:
-                    index[tok].append(("details", streamer, 0))
+                    postings[tok][doc_id] += 1
 
-    return index
+    # Reddit posts
+    for streamer, posts in reddit_data.items():
+        if not is_valid_username(streamer) or not isinstance(posts, list): continue
+        for i, post in enumerate(posts):
+            add_doc("reddit", streamer, i, post.get("Title", ""), post.get("Score", 1))
 
-def boolean_search(query, index):
-    terms = [t for t in re.findall(r"\w+", query.lower()) if t not in STOP_WORDS]
-    if not terms: return []
-    
-    matches, info = defaultdict(int), {}
+    # Twitter tweets
+    for streamer, tweets in twitter_data.items():
+        if not is_valid_username(streamer) or not isinstance(tweets, list): continue
+        for i, tweet in enumerate(tweets):
+            add_doc("twitter", streamer, i, str(tweet), 1)
+
+    # Wiki entries
+    for streamer, entry in wiki_data.items():
+        if not is_valid_username(streamer) or not isinstance(entry, dict): continue
+        content = entry.get("content", "")
+        add_doc("wiki", streamer, 0, content, 2)
+
+    # Details
+    for streamer, details in details_data.items():
+        if not is_valid_username(streamer) or not isinstance(details, dict): continue
+        desc = str(details.get("Description", ""))
+        add_doc("details", streamer, 0, desc, 3)
+
+    return postings, doc_info
+
+from collections import defaultdict
+import re
+
+def boolean_search(query, postings, doc_info):
+    """
+    Perform boolean search over precomputed postings + metadata.
+
+    Args:
+        query (str): raw user query.
+        postings (dict): term → { doc_id → term_freq }.
+        doc_info (dict): doc_id → metadata dict (with source, text, etc.).
+
+    Returns:
+        List[dict]: one metadata dict per matching doc, with 'term_matches' set.
+    """
+    # 1) extract tokens exactly as in your index
+    terms = [
+        t.lower()
+        for t in TOKEN_PATTERN.findall(query)
+        if t.lower() not in STOP_WORDS
+    ]
+    if not terms:
+        return []
+
+    # 2) sum up each doc's term frequencies
+    matches = defaultdict(int)
     for term in terms:
-        if term not in index: continue
-        for source, streamer, idx in index[term]:
-            doc_id = f"{source}:{streamer}:{idx}"
-            matches[doc_id] += 1
-            
-            if doc_id in info: continue
-            
-            # Extract document text based on source
-            text, score = "", 1
-            try:
-                if source == "reddit" and streamer in reddit_data and isinstance(reddit_data[streamer], list):
-                    if idx < len(reddit_data[streamer]) and isinstance(post := reddit_data[streamer][idx], dict):
-                        text, score = post.get("Title", ""), post.get("Score", 1)
-                        info[doc_id] = {"source": source, "streamer": streamer, "data": post, 
-                                       "text": text, "score": score, "idx": idx, "term_matches": 0}
-                
-                elif source == "twitter" and streamer in twitter_data and isinstance(twitter_data[streamer], list):
-                    if idx < len(twitter_data[streamer]):
-                        text = str(twitter_data[streamer][idx])
-                        info[doc_id] = {"source": source, "streamer": streamer, "data": twitter_data[streamer][idx],
-                                       "text": text, "score": 1, "idx": idx, "term_matches": 0}
-                
-                elif source == "wiki" and streamer in wiki_data and isinstance(wiki_data[streamer], dict):
-                    chunks = split_text(wiki_data[streamer].get("content", ""))
-                    if idx < len(chunks):
-                        text = chunks[idx]
-                        info[doc_id] = {"source": source, "streamer": streamer, "data": wiki_data[streamer],
-                                       "text": text, "score": 2, "idx": idx, "term_matches": 0}
-                
-                elif source == "details" and streamer in details_data and isinstance(details_data[streamer], dict):
-                    text = str(details_data[streamer].get("Description", ""))
-                    info[doc_id] = {"source": source, "streamer": streamer, "data": details_data[streamer],
-                                   "text": text, "score": 3, "idx": idx, "term_matches": 0}
-            except: continue
-    
-    for doc_id, count in matches.items():
-        if doc_id in info: info[doc_id]["term_matches"] = count
-    
-    return list(info.values())
+        for doc_id, tf in postings.get(term, {}).items():
+            matches[doc_id] += tf
+
+    # 3) pull full metadata and inject term_matches
+    results = []
+    for doc_id, term_matches in matches.items():
+        info = doc_info[doc_id].copy()
+        info["term_matches"] = term_matches
+        results.append(info)
+
+    return results
 
 def score_boolean_results(results, query):
-    terms = re.findall(r"\w+", query.lower())
+    # 1) extract same tokens you indexed
+    terms = [
+        t.lower()
+        for t in TOKEN_PATTERN.findall(query)
+        if t.lower() not in STOP_WORDS
+    ]
     scored = []
-    
     for doc in results:
-        if not isinstance(doc, dict): continue
-        
-        text = doc.get("text", "")
+        text = doc.get("text", "").lower()
+        # base: TF × 15
         score = doc.get("term_matches", 0) * 15
-        score += sum(text.lower().count(term) * 5 for term in terms)
-        
+
+        # whole-word extra matches
+        for term in terms:
+            count = len(re.findall(rf"\b{re.escape(term)}\b", text))
+            score += count * 5
+
+        # the rest of your existing boosts…
         ss = doc.get("score", 1)
         if doc["source"] == "reddit" and isinstance(ss, (int, float)):
-            score += min(ss / 500.0, 20) if ss > 0 else 0
-        elif doc["source"] == "wiki": score += 15
-        elif doc["source"] == "details": score += 10
-        
-        if query.lower() in text.lower(): score += 50
-        
+            score += min(ss/500.0, 20) if ss>0 else 0
+        elif doc["source"] == "wiki":
+            score += 15
+        elif doc["source"] == "details":
+            score += 10
+
+        if re.search(rf"\b{re.escape(query.lower())}\b", text):
+            score += 50
+
         snippet = make_snippet(text, terms)
         fmt = {
             "source": doc["source"],
-            "name": doc["streamer"],
+            "name":   doc["streamer"],
             "snippet": snippet,
-            "idx": doc["idx"],
-            "doc": snippet,
+            "idx":    doc["idx"],
+            "doc":    snippet,
             "boolean_score": round(score, 2),
-            "term_matches": doc.get("term_matches", 0)
+            "term_matches":  doc.get("term_matches", 0)
         }
-        
         if doc["source"] == "reddit" and isinstance(doc.get("data"), dict):
             fmt["reddit_score"] = ss
-            fmt["id"] = doc["data"].get("ID", "")
-        
+            fmt["id"]           = doc["data"].get("ID", "")
         scored.append((fmt, score))
-    
-    return [d for d, s in sorted(scored, key=lambda x: x[1], reverse=True)]
+
+    return [d for d,_ in sorted(scored, key=lambda x: x[1], reverse=True)]
 
 # SEMANTIC SEARCH
 def gather_documents():
@@ -341,7 +332,9 @@ def score_semantic_results(results, query):
             score += min(ss / 500.0, 20) if ss > 0 else 0
         
         # Term frequency bonus
-        score += sum(text.count(term) * 2 for term in terms if term)
+        for term in terms:
+            count = len(re.findall(rf"\b{re.escape(term)}\b", text))
+            score += count * 2
         
         # Exact phrase bonus
         if query and query.lower() in text: score += 30
@@ -452,19 +445,33 @@ def combine_results(bool_res, sem_res, threshold=5.0):
 # INITIALIZE SEARCH SYSTEM
 print("Initializing search system...")
 
-# Load or build boolean index
+# Load or build postings + doc_info
 try:
     if os.path.exists(BOOLEAN_INDEX_PATH):
         with open(BOOLEAN_INDEX_PATH, "rb") as f:
-            boolean_index = pickle.load(f)
+            postings, doc_info = pickle.load(f)
     else:
         print("Building boolean index...")
-        boolean_index = create_boolean_index()
+        postings, doc_info = create_boolean_index()
+
+        # Convert defaultdicts → plain dicts so pickle won’t choke
+        clean_postings = {
+            term: dict(doc_map)
+            for term, doc_map in postings.items()
+        }
+
+        # Overwrite disk cache
         with open(BOOLEAN_INDEX_PATH, "wb") as f:
-            pickle.dump(boolean_index, f)
+            pickle.dump((clean_postings, doc_info), f)
+
+        # And use the clean dict in memory from now on:
+        postings = clean_postings
+
 except Exception as e:
     print(f"Error with boolean index: {e}")
-    boolean_index = create_boolean_index()
+    postings, doc_info = create_boolean_index()
+
+
 
 # Initialize model
 device = "cpu"
@@ -540,63 +547,65 @@ def home():
     return render_template("base.html", title="Streamer Search")
 
 @app.route("/search")
+@app.route("/search")
 def search_streamer():
     query = request.args.get("name", "").strip()
-    if not query: return jsonify([])
-    
-    # Boolean search
-    bool_res = score_boolean_results(boolean_search(query, boolean_index), query)
-    
-    # Semantic search
+    if not query:
+        return jsonify([])
+
+    # 1) Boolean search using precomputed postings & doc_info
+    bool_raw = boolean_search(query, postings, doc_info)
+    bool_res = score_boolean_results(bool_raw, query)
+
+    # 2) Semantic search
     sem_raw = []
     try:
-        q_emb = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
-        
-        # Get semantically similar documents (higher score = better match with IndexFlatIP)
+        q_emb = model.encode(
+            [query],
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
         scores, ids = index.search(q_emb, TOP_K)
-        
         for score, idx in zip(scores[0], ids[0]):
-            if idx == -1 or idx >= len(DOCS): continue
-            
+            if idx == -1 or idx >= len(DOCS):
+                continue
             meta = DOCS[idx]
-            if not isinstance(meta, dict): continue
-            
-            # Normalize cosine similarity to 0-100 range
-            sim_score = max(0.0, min(1.0, score)) * 100
-            
+            sim_score = round(max(0.0, min(1.0, score)) * 100, 2)
             sem_raw.append({
-                "source": meta.get("source", "unknown"),
+                "source":   meta.get("source", "unknown"),
                 "streamer": meta.get("streamer", "unknown"),
-                "text": meta.get("text", ""),
-                "idx": meta.get("idx", idx),
-                "score": meta.get("score", 1),
-                "data": meta.get("data", {}),
-                "sim_score": round(sim_score, 2)
+                "text":     meta.get("text", ""),
+                "idx":      meta.get("idx", idx),
+                "score":    meta.get("score", 1),
+                "data":     meta.get("data", {}),
+                "sim_score": sim_score
             })
     except Exception as e:
         print(f"Error in semantic search: {e}")
-    
+
     sem_res = score_semantic_results(sem_raw, query)
-    
-    # Combine results
+
+    # 3) Combine boolean + semantic results
     comb_res = combine_results(bool_res, sem_res)
-    
-    # Format final output
-    final_res = []
+
+    # 4) Filter only valid top-1000 streamers
     comb_res = [sd for sd in comb_res if sd.get("name", "").lower() in valid_streamers]
 
-    for sd in comb_res[:10]:  # Limit to top 10 streamers
-        name = sd.get("name", "Unknown")
-        docs = sd.get("documents", [])[:4]  # Limit to top 4 docs per streamer
-        
+    # 5) Format the final output for JSON
+    final_res = []
+    for sd in comb_res[:10]:  # top 10 streamers
+        name = sd["name"]
+        docs = sd["documents"][:4]  # up to 4 docs per streamer
         final_res.append({
-            "name": name,
-            "documents": docs,
-            "twitch_info": get_twitch_info(name),
-            "image_path": get_image_path(name),
-            "csv_data": streamer_csv_data.get(name.upper().strip(), {}),
+            "name":         name,
+            "documents":    docs,
+            "twitch_info":  get_twitch_info(name),
+            "image_path":   get_image_path(name),
+            "csv_data":     streamer_csv_data.get(name.upper().strip(), {}),
             "sum_top3_score": sd.get("sum_top3_score", 0.0)
         })
+
+    # 6) Sanitize numpy types before jsonify
     def sanitize(o):
         if isinstance(o, np.generic):
             return o.item()
@@ -606,6 +615,7 @@ def search_streamer():
 
     clean = json.loads(json.dumps(final_res, default=sanitize))
     return jsonify(clean)
+
     
 
 
