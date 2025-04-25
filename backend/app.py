@@ -9,24 +9,8 @@ import gc
 from tqdm import tqdm
 
 
-print("👋 app.py launched", flush=True)
-app_dir = os.path.abspath(os.path.dirname(__file__))
-print("App directory:", app_dir, flush=True)
-
-# Filter out static folder when listing contents
-contents = [item for item in os.listdir(app_dir) if item != "static"]
-print("Contents:", contents, flush=True)
-
-# Skip the static folder when walking through directories
-for root, _, files in os.walk(app_dir):
-    if "static" not in root:
-        for f in files:
-            print(os.path.join(root, f), flush=True)
-
-print("sys.path =", sys.path, flush=True)
-print("ENV PATH =", os.environ.get("PATH", ""), flush=True)
-
-
+df = pd.read_csv('top_1000_twitch.csv', dtype=str)
+valid_streamers = {n.lower() for n in df['Name'].str.strip()}
 
 # CONFIG
 MODEL_NAME             = "intfloat/e5-base-v2"
@@ -38,7 +22,7 @@ SEMANTIC_WEIGHT        = 0.5
 BOOLEAN_WEIGHT         = 0.5
 TWITCH_USERNAME_REGEX = r'^[a-z0-9_]{4,25}'
 
-STOP_WORDS = {"the", "and", "a", "of", "to", "in", "is", "you", "that", "it", "was", "for", "on", "streamer"}
+STOP_WORDS = {"the", "and", "a", "of", "to", "in", "is", "you","who", "that", "it", "was", "for", "on", "streamer"}
 
 # LOAD DATA
 BACK = os.path.dirname(os.path.abspath(__file__))
@@ -163,35 +147,64 @@ def get_image_path(name):
 # BOOLEAN SEARCH
 def create_boolean_index():
     index = defaultdict(list)
-    # Reddit
+    # Match alphanumeric sequences, possibly joined by interior hyphens
+    token_pattern = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
+
+    # — Reddit posts —
     for streamer, posts in reddit_data.items():
-        if not is_valid_username(streamer) or not isinstance(posts, list): continue
+        if not is_valid_username(streamer) or not isinstance(posts, list):
+            continue
         for i, post in enumerate(posts):
-            if not isinstance(post, dict): continue
-            for w in [w for w in re.findall(r"\w+", post.get("Title", "").lower()) if w not in STOP_WORDS]:
-                index[w].append(("reddit", streamer, i))
-    
-    # Twitter
+            title = post.get("Title", "")
+            for raw_tok in token_pattern.findall(title.lower()):
+                toks = {raw_tok}
+                if "-" in raw_tok:
+                    toks.update(raw_tok.split("-"))
+                for tok in toks:
+                    if tok not in STOP_WORDS:
+                        index[tok].append(("reddit", streamer, i))
+
+    # — Twitter tweets —
     for streamer, tweets in twitter_data.items():
-        if not is_valid_username(streamer) or not isinstance(tweets, list): continue
+        if not is_valid_username(streamer) or not isinstance(tweets, list):
+            continue
         for i, tweet in enumerate(tweets):
-            for w in [w for w in re.findall(r"\w+", str(tweet).lower()) if w not in STOP_WORDS]:
-                index[w].append(("twitter", streamer, i))
-    
-    # Wiki
+            text = str(tweet)
+            for raw_tok in token_pattern.findall(text.lower()):
+                toks = {raw_tok}
+                if "-" in raw_tok:
+                    toks.update(raw_tok.split("-"))
+                for tok in toks:
+                    if tok not in STOP_WORDS:
+                        index[tok].append(("twitter", streamer, i))
+
+    # — Wiki entries (one doc per streamer) —
     if isinstance(wiki_data, dict):
         for streamer, entry in wiki_data.items():
-            if not is_valid_username(streamer) or not isinstance(entry, dict): continue
-            for i, chunk in enumerate(split_text(entry.get("content", ""))):
-                for w in [w for w in re.findall(r"\w+", chunk.lower()) if w not in STOP_WORDS]:
-                    index[w].append(("wiki", streamer, i))
-    
-    # Details
+            if not is_valid_username(streamer) or not isinstance(entry, dict):
+                continue
+            content = entry.get("content", "")
+            for raw_tok in token_pattern.findall(content.lower()):
+                toks = {raw_tok}
+                if "-" in raw_tok:
+                    toks.update(raw_tok.split("-"))
+                for tok in toks:
+                    if tok not in STOP_WORDS:
+                        index[tok].append(("wiki", streamer, 0))
+
+    # — Details descriptions —
     for streamer, details in details_data.items():
-        if not is_valid_username(streamer) or not isinstance(details, dict): continue
-        for w in [w for w in re.findall(r"\w+", str(details.get("Description", "")).lower()) if w not in STOP_WORDS]:
-            index[w].append(("details", streamer, 0))
-    
+        if not is_valid_username(streamer) or not isinstance(details, dict):
+            continue
+        desc = str(details.get("Description", ""))
+        for raw_tok in token_pattern.findall(desc.lower()):
+            toks = {raw_tok}
+            if "-" in raw_tok:
+                toks.update(raw_tok.split("-"))
+            for tok in toks:
+                if tok not in STOP_WORDS:
+                    index[tok].append(("details", streamer, 0))
+
     return index
 
 def boolean_search(query, index):
@@ -570,6 +583,8 @@ def search_streamer():
     
     # Format final output
     final_res = []
+    comb_res = [sd for sd in comb_res if sd.get("name", "").lower() in valid_streamers]
+
     for sd in comb_res[:10]:  # Limit to top 10 streamers
         name = sd.get("name", "Unknown")
         docs = sd.get("documents", [])[:4]  # Limit to top 4 docs per streamer

@@ -18,7 +18,7 @@
             </div>
             <div class="input-box" onclick="sendFocus()">
                 <img src="{{ url_for('static', filename='images/mag.png') }}" />
-                <input placeholder="Search for a Twitch streamer" id="filter-text-val" onkeyup="filterText()">
+                <input placeholder="Search for a Twitch streamer" id="filter-text-val" oninput="debouncedFilter()">
             </div>
         </div>
         <div id="answer-box">
@@ -556,3 +556,16 @@
         }
     </style>
 </body>
+<script>
+    // 1) Debounce helper (add this once)
+    function debounce(fn, delay = 300) {
+        let timer;
+        return function (...args) {
+            clearTimeout(timer);
+            timer = setTimeout(() => fn.apply(this, args), delay);
+        };
+    }
+
+    // 2) Wrap your existing filterText() in a debounced version
+    const debouncedFilter = debounce(filterText, 300);
+</script>
