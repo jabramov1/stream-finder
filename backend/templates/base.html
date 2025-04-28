@@ -18,8 +18,7 @@
             </div>
             <div class="input-box" onclick="sendFocus()">
                 <img src="{{ url_for('static', filename='images/mag.png') }}" />
-                <input placeholder="Search for a Twitch streamer" id="filter-text-val" onkeyup="enterSearch(event)">
-                <button class="search-button" onclick="filterText()">Search</button>
+                <input placeholder="Search for a Twitch streamer" id="filter-text-val" oninput="debouncedFilter()">
             </div>
         </div>
         <div id="answer-box">
@@ -44,13 +43,6 @@
                 }
             });
         });
-
-        // Search on Enter key press
-        function enterSearch(event) {
-            if (event.key === "Enter") {
-                filterText();
-            }
-        }
 
         // Generates HTML for a streamer card, including Twitch info and placeholder for live metrics.
         function streamerCardTemplate(streamerData) {
@@ -118,43 +110,33 @@
         }
 
         function documentTemplate(doc) {
-            // Determine source icon based on source type
-            let sourceIcon = "";
-            switch(doc.source) {
+            // pick an emoji based on the source
+            let icon = "";
+            switch (doc.source) {
+                case "twitter":
+                    icon = "🐦";
+                    break;
                 case "wiki":
-                    sourceIcon = "📚";
+                    icon = "📰";
                     break;
                 case "reddit":
-                    sourceIcon = "📱";
+                    icon = "📱";
                     break;
-                case "twitter":
-                    sourceIcon = "🐦";
+                case "semantic BERT":
+                    icon = "🤖";
                     break;
-                case "details":
-                    sourceIcon = "ℹ️";
-                    break;
-                default:
-                    sourceIcon = "📄";
             }
-            
-            // Show score badge appropriate to the source
-            let scoreBadge = "";
-            if (doc.sim_score !== undefined) {
-                scoreBadge = `<span class="score-badge semantic-badge">Semantic: ${doc.sim_score}</span>`;
-            } else if (doc.boolean_score !== undefined) {
-                scoreBadge = `<span class="score-badge boolean-badge">Boolean: ${doc.boolean_score}</span>`;
-            }
-            
+
             return `
-                <div class="document-item" data-source="${doc.source}">
-                    <div class="doc-header">
-                        <span class="source-icon">${sourceIcon}</span>
-                        <span class="source">${doc.source.charAt(0).toUpperCase() + doc.source.slice(1)}</span>
-                        ${scoreBadge}
-                    </div>
-                    <p class="doc">${doc.doc}</p>
-                </div>
-            `;
+        <div class="document-item">
+            <span class="icon">${icon}</span>
+            <p class="doc">${doc.doc}</p>
+            <div class="meta-info">
+                <span class="source">Source: ${doc.source}</span>
+                <span class="sim-score">Score: ${doc.final_score}</span>
+            </div>
+        </div>
+    `;
         }
 
         function sendFocus() {
@@ -162,18 +144,13 @@
         }
 
         function filterText() {
-            document.getElementById("answer-box").innerHTML = 
-                '<div class="loading">Searching streamers...</div>';
+            document.getElementById("answer-box").innerHTML = "";
             const searchTerm = document.getElementById("filter-text-val").value;
-            if (searchTerm.trim() === "") {
-                document.getElementById("answer-box").innerHTML = "";
-                return;
-            }
+            if (searchTerm.trim() === "") return;
 
             fetch("/search?" + new URLSearchParams({ name: searchTerm }).toString())
                 .then(response => response.json())
                 .then(data => {
-                    document.getElementById("answer-box").innerHTML = "";
                     if (data.length === 0) {
                         document.getElementById("answer-box").innerHTML = "<div class='no-results'>No results found</div>";
                         return;
@@ -183,7 +160,7 @@
                         tempDiv.innerHTML = streamerCardTemplate(streamerData);
                         document.getElementById("answer-box").appendChild(tempDiv);
                     });
-                    // After results render, update live metrics
+                    // After results render, update live metric
                     updateLiveIndicators();
                 })
                 .catch(error => {
@@ -237,10 +214,6 @@
             --card-shadow: 0 3px 10px rgba(0, 0, 0, 0.1);
             --input-bg: white;
             --document-bg: #f9f9f9;
-            --tag-bg: rgba(100, 65, 165, 0.1);
-            --tag-color: #6441a5;
-            --semantic-badge: rgba(76, 175, 80, 0.2);
-            --boolean-badge: rgba(33, 150, 243, 0.2);
         }
 
         /* Dark theme variables */
@@ -256,10 +229,6 @@
             --card-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
             --input-bg: #333;
             --document-bg: #2c2c2c;
-            --tag-bg: rgba(145, 71, 255, 0.2);
-            --tag-color: #b47eff;
-            --semantic-badge: rgba(76, 175, 80, 0.3);
-            --boolean-badge: rgba(33, 150, 243, 0.3);
         }
 
         body {
@@ -329,22 +298,6 @@
             color: var(--text-color);
         }
 
-        .search-button {
-            background-color: var(--accent-color);
-            color: white;
-            border: none;
-            border-radius: 20px;
-            padding: 8px 16px;
-            font-family: 'Montserrat', sans-serif;
-            font-size: 14px;
-            cursor: pointer;
-            transition: background-color 0.2s ease;
-        }
-
-        .search-button:hover {
-            background-color: #7a57bc;
-        }
-
         #answer-box {
             width: 700px;
             margin-top: 50px;
@@ -368,19 +321,15 @@
         }
 
         .live-indicator {
+            position: absolute;
+            top: 10px;
+            right: 10px;
             background-color: red;
             color: white;
             padding: 5px 10px;
             font-weight: bold;
             border-radius: 5px;
-            display: inline-block;
-            margin-bottom: 8px;
-        }
-
-        .offline-status {
-            color: var(--secondary-text);
-            display: inline-block;
-            margin-top: 8px;
+            z-index: 2;
         }
 
         .twitch-metrics {
@@ -419,13 +368,6 @@
             font-family: 'Kanit', sans-serif;
             font-size: 24px;
             color: var(--text-color);
-        }
-        
-        .bio-text {
-            font-size: 14px;
-            color: var(--secondary-text);
-            margin-bottom: 10px;
-            line-height: 1.4;
         }
 
         .twitch-link {
@@ -474,40 +416,6 @@
         .document-item:hover {
             transform: translateX(3px);
         }
-        
-        .doc-header {
-            display: flex;
-            align-items: center;
-            margin-bottom: 8px;
-        }
-        
-        .source-icon {
-            margin-right: 6px;
-            font-size: 16px;
-        }
-        
-        .source {
-            font-weight: 500;
-            color: var(--secondary-text);
-            margin-right: 8px;
-        }
-        
-        .score-badge {
-            font-size: 11px;
-            padding: 2px 8px;
-            border-radius: 12px;
-            margin-left: auto;
-        }
-        
-        .semantic-badge {
-            background-color: var(--semantic-badge);
-            color: #2e7d32;
-        }
-        
-        .boolean-badge {
-            background-color: var(--boolean-badge);
-            color: #1976d2;
-        }
 
         .document-item .doc {
             margin: 0 0 10px 0;
@@ -518,20 +426,23 @@
 
         .meta-info {
             display: flex;
-            justify-content: flex-end;
+            justify-content: space-between;
             font-size: 0.85em;
             color: var(--secondary-text);
             font-family: 'Montserrat', sans-serif;
         }
 
-        .final-score {
+        .source {
+            font-weight: 500;
+        }
+
+        .sim-score {
             color: var(--accent-color);
             font-weight: 500;
         }
 
         .no-results,
-        .error,
-        .loading {
+        .error {
             padding: 30px;
             text-align: center;
             color: var(--secondary-text);
@@ -544,17 +455,6 @@
         .error {
             color: #cc0000;
             border-left: 4px solid #cc0000;
-        }
-        
-        .loading {
-            border-left: 4px solid var(--accent-color);
-            animation: pulse 1.5s infinite;
-        }
-        
-        @keyframes pulse {
-            0% { opacity: 0.6; }
-            50% { opacity: 1; }
-            100% { opacity: 0.6; }
         }
 
         .theme-toggle {
@@ -639,25 +539,33 @@
         .slider.round:before {
             border-radius: 50%;
         }
-        
-        /* Mobile Responsiveness */
-        @media (max-width: 768px) {
-            .input-box {
-                width: 90vw;
-            }
-            
-            #answer-box {
-                width: 90vw;
-            }
-            
-            .theme-toggle {
-                position: static;
-                margin: 10px 0;
-            }
-            
-            .top-text {
-                margin-top: 15px;
-            }
+
+        .document-item {
+            display: flex;
+            align-items: flex-start;
+        }
+
+        .document-item .icon {
+            margin-right: 8px;
+            font-size: 1.2em;
+            line-height: 1em;
+        }
+
+        .document-item .doc {
+            flex: 1;
         }
     </style>
 </body>
+<script>
+    // 1) Debounce helper (add this once)
+    function debounce(fn, delay = 300) {
+        let timer;
+        return function (...args) {
+            clearTimeout(timer);
+            timer = setTimeout(() => fn.apply(this, args), delay);
+        };
+    }
+
+    // 2) Wrap your existing filterText() in a debounced version
+    const debouncedFilter = debounce(filterText, 300);
+</script>
